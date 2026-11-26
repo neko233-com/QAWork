@@ -7,7 +7,7 @@ QAWork 的工程规则。改代码前先读这一页。
 - **Go 1.27+，纯 Go，`CGO_ENABLED=0`**。不允许 `import "C"`，不允许 C/C++ 构建依赖。
 - **构建硬约束**：所有构建、测试、CI 都显式 `CGO_ENABLED=0`；验证时 `go env CGO_ENABLED` 必须是 `0`。引入 cgo 的 PR 直接拒，不讨论"临时开一下"。
 - **原生 UI**：`github.com/egoist/mygo`（`ui.View` / `ui.Context`）+ `github.com/lobehub/lobe-mygo/pkg/theme`（设计令牌）。不用 WebView、HTML、CSS、JS。
-- **发布目标**：`windows/amd64` 与 `darwin/arm64`，各出 `qawork` / `qawork-gui`，产物进 `dist/`。只支持这两个宿主平台，不上 Linux/32 位；当前开发机是 Windows 时只做 Windows 真实验证，macOS 由 CI + 真机补。
+- **发布目标**：`windows/amd64` 与 `darwin/arm64`，各出 `qawork` / `qawork-gui`，产物进 `dist/`。只支持这两个宿主平台，不上 Linux/32 位；当前开发机是 Windows 时只做 Windows 真实验证，macOS 由 CI 交叉编译 + Mac 真机补跑。
 
 ## 工作模式（固定，不许漂移）
 
@@ -94,7 +94,7 @@ go build -o qawork-gui.exe .\cmd\qawork-gui
 .\qawork-gui.exe -setup -capture .\docs\setup.png # 环境页自检
 ```
 
-macOS 另跑（真机或 CI 必须至少做交叉编译与单测）：
+macOS 有真机时另跑（没有真机就只保留交叉编译与 darwin 单测编译）：
 
 ```bash
 CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./cmd/qawork ./cmd/qawork-gui

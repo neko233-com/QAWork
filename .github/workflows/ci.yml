@@ -1,4 +1,4 @@
-name: CI & Release (Windows x64, macOS arm64)
+name: CI & Release (Windows x64 + macOS arm64 cross)
 
 on:
   push:
@@ -13,19 +13,7 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            artifact: qawork-windows-amd64
-            cli: qawork.exe
-            gui: qawork-gui.exe
-          - os: macos-13
-            artifact: qawork-macos-arm64
-            cli: qawork
-            gui: qawork-gui
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     env:
       CGO_ENABLED: "0"
     steps:
@@ -42,51 +30,63 @@ jobs:
       - name: Assert gofmt clean
         shell: bash
         run: |
-          files="$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))"
+          files="$(gofmt -l $(git ls-files '*.go'))"
           if [ -n "$files" ]; then echo "gofmt needed:"; echo "$files"; exit 1; fi
       - name: Vet
         run: go vet ./...
       - name: Test
         run: go test -count=1 ./...
-      - name: Build CLI and GUI
+      - name: Build Windows CLI and GUI
         shell: bash
         run: |
-          mkdir -p dist
-          go build -trimpath -o "dist/${{ matrix.cli }}" ./cmd/qawork
-          go build -trimpath -o "dist/${{ matrix.gui }}" ./cmd/qawork-gui
+          mkdir -p dist/qawork-windows-amd64
+          go build -trimpath -o dist/qawork-windows-amd64/qawork.exe ./cmd/qawork
+          go build -trimpath -o dist/qawork-windows-amd64/qawork-gui.exe ./cmd/qawork-gui
+      - name: Cross-build macOS arm64
+        shell: bash
+        run: |
+          mkdir -p dist/qawork-macos-arm64
+          GOOS=darwin GOARCH=arm64 go build -trimpath -o dist/qawork-macos-arm64/qawork ./cmd/qawork
+          GOOS=darwin GOARCH=arm64 go build -trimpath -o dist/qawork-macos-arm64/qawork-gui ./cmd/qawork-gui
+          go version -m dist/qawork-macos-arm64/qawork | head -3
       - name: Smoke test CLI
         shell: bash
-        run: ./dist/${{ matrix.cli }} version
+        run: ./dist/qawork-windows-amd64/qawork.exe version
       - name: Validate example plan
         shell: bash
-        run: ./dist/${{ matrix.cli }} run -plan examples/qawork.yaml -validate
+        run: ./dist/qawork-windows-amd64/qawork.exe run -plan examples/qawork.yaml -validate
       - name: Smoke test MCP
         shell: bash
         run: |
-          out="$(echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./dist/${{ matrix.cli }} mcp 2>/dev/null)"
+          out="$(echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./dist/qawork-windows-amd64/qawork.exe mcp 2>/dev/null)"
           echo "$out" | grep -q '"qawork_perf"'
           echo "$out" | grep -q '"qawork_doctor"'
           echo "$out" | grep -q '"qawork_validate_plan"'
           echo "$out" | grep -q '"qawork_compat_matrix"'
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/*
+          name: qawork-windows-amd64
+          path: dist/qawork-windows-amd64/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qawork-macos-arm64
+          path: dist/qawork-macos-arm64/*
           if-no-files-found: error
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
-    runs-on: macos-13
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: qawork-*
           path: dist
       - name: Package
-        shell: bash
         run: |
           mkdir -p release
+          chmod +x dist/qawork-macos-arm64/qawork dist/qawork-macos-arm64/qawork-gui
           tar -czf release/QAWork-macos-arm64.tar.gz -C dist/qawork-macos-arm64 .
           (cd dist/qawork-windows-amd64 && zip -r ../../release/QAWork-windows-amd64.zip .)
       - name: Publish release

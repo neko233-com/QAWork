@@ -34,7 +34,7 @@
 
 ## 宿主平台
 
-只支持两个宿主：**Windows x86（amd64）** 与 **macOS arm64**；当前开发机是 Windows 时只做 Windows 真实验证，macOS 由 CI 与真机补。Android 侧统一走 adb，不区分宿主。
+只支持两个宿主：**Windows x86（amd64）** 与 **macOS arm64**；当前开发机是 Windows 时只做 Windows 真实验证，macOS 由 CI 交叉编译 + Mac 真机补跑。Android 侧统一走 adb，不区分宿主。
 
 ## 快速开始
 
