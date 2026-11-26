@@ -1,0 +1,15 @@
+# build output
+/qawork.exe
+/qawork-gui.exe
+/dist/
+*.msi
+*.dmg
+*.zip
+
+# local captures and smoke data
+/smoke*.csv
+/sessions/
+
+# OS junk
+.DS_Store
+Thumbs.db
