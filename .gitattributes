@@ -1,0 +1,4 @@
+# Keep Go and workflow sources LF on every host so gofmt is deterministic.
+*.go text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
