@@ -5,9 +5,24 @@ QAWork 的工程规则。改代码前先读这一页。
 ## 栈与约束
 
 - **Go 1.27+，纯 Go，`CGO_ENABLED=0`**。不允许 `import "C"`，不允许 C/C++ 构建依赖。
+- **构建硬约束**：所有构建、测试、CI 都显式 `CGO_ENABLED=0`；验证时 `go env CGO_ENABLED` 必须是 `0`。引入 cgo 的 PR 直接拒，不讨论"临时开一下"。
 - **原生 UI**：`github.com/egoist/mygo`（`ui.View` / `ui.Context`）+ `github.com/lobehub/lobe-mygo/pkg/theme`（设计令牌）。不用 WebView、HTML、CSS、JS。
 - **发布目标**：`windows/amd64` 的 `qawork.exe` 与 `qawork-gui.exe`，产物进 `dist/`。macOS 不是当前验收目标。
-- **产品定位**：产品名 QAWork，对标腾讯 WeTest；**默认工作模式 = PerfDog 性能模式**。这条不许在迭代中漂移。
+
+## 工作模式（固定，不许漂移）
+
+| # | 模式 | 状态 | 竞品/口径 |
+| --- | --- | --- | --- |
+| 0 | **PerfDog 性能**（默认） | 可用 | 竞品：[腾讯 PerfDog](https://wetest.qq.com/products/perfdog)，只对齐采集口径 |
+| 1 | 兼容性 | 规划中 | 本地设备农场矩阵，对标 WeTest 云真机的场景，不属于 PerfDog 能力 |
+| 2 | 自动化 | 规划中 | `qawork.yaml` + adb 回放 + 性能门禁 |
+
+规则：
+
+- `internal/app` 的 `Mode` 默认必须是 `0`（PerfDog 性能），GUI 启动即进入该模式。
+- 新增/改名模式要同时改三处：`internal/app` 的模式常量与标签、README「工作模式」、本表。
+- 未实现的模式只能显示"规划中"，不许在 UI 里给出假数据、假进度、假报告。
+- 竞品固定指 PerfDog 产品页 <https://wetest.qq.com/products/perfdog>；WeTest 只作为其母平台在必要处提及，不要混为同一竞品。
 
 ## 分层
 

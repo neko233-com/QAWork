@@ -36,10 +36,20 @@ const (
 	tableSamples   = 40
 )
 
+// The workbench declares three modes. Only PerfDog performance capture is
+// wired; compatibility and automation are labelled as planned, never
+// filled with mock data. The default stays PerfDog, and the numbering is
+// part of the app's public shape.
+const (
+	ModePerfDog = iota
+	ModeCompat
+	ModeAutomation
+)
+
 // App is the state of the workbench.
 type App struct {
 	ADB           perf.ADB
-	Mode          int // 0 PerfDog 性能, 1 兼容性, 2 自动化
+	Mode          int // ModePerfDog 默认, ModeCompat, ModeAutomation
 	Serial        string
 	Target        string // Android package or Windows executable
 	Interval      int
@@ -69,7 +79,7 @@ type App struct {
 func New(host Host) *App {
 	return &App{
 		ADB:           perf.ADB{},
-		Mode:          0,
+		Mode:          ModePerfDog,
 		Interval:      1,
 		IntervalLabel: "1 s",
 		NominalFPS:    60,
@@ -311,9 +321,9 @@ func (a *App) View(c *ui.Context) {
 			a.sidebar(c, tk)
 			ui.Column(c).Grow(1).Basis(0).MinHeight(0).Padding(16).Gap(12).Children(func() {
 				switch a.Mode {
-				case 1:
+				case ModeCompat:
 					a.compatPanel(c, tk)
-				case 2:
+				case ModeAutomation:
 					a.automationPanel(c, tk)
 				default:
 					a.perfPanel(c, tk)
@@ -327,7 +337,7 @@ func (a *App) View(c *ui.Context) {
 func (a *App) header(c *ui.Context, tk *theme.Tokens) {
 	ui.Row(c).Padding(12, 16).Gap(12).AlignItems(ui.Center).Children(func() {
 		ui.Text(c, version.Product).FontSize(22).Bold().TextColor(tk.Text)
-		ui.Badge(c, "对标 WeTest")
+		ui.Badge(c, "对标 PerfDog")
 		ui.Segmented(c, &a.Mode, "PerfDog 性能", "兼容性", "自动化")
 		ui.Spacer(c)
 		if a.IsRunning() {
@@ -555,13 +565,13 @@ func (a *App) compatPanel(c *ui.Context, tk *theme.Tokens) {
 			ui.Text(c, "兼容性矩阵").FontSize(16).Bold().TextColor(tk.Text)
 			ui.Badge(c, "规划中")
 		})
-		ui.Text(c, "对标 WeTest 的云真机兼容性：QAWork 不上传安装包，走本地设备农场。").
+		ui.Text(c, "PerfDog 只做性能；兼容性在 QAWork 里是另一条线：本地设备农场，不上传安装包。").
 			FontSize(12).TextColor(tk.TextSecondary).Wrap()
 		for _, item := range []string{
 			"多机型批量安装、冷启动、首帧耗时",
 			"分辨率 / 系统版本 / ABI 矩阵，结果本地落盘",
 			"崩溃与 ANR 率统计，同一 CSV 口径进 CI",
-			"预留云真机通道：WeTest / 自建设备池二选一",
+			"预留云真机通道：租云设备或自建设备池，二选一",
 		} {
 			ui.Text(c, "· "+item).FontSize(12).TextColor(tk.TextSecondary).Wrap()
 		}

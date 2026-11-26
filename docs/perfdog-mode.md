@@ -1,6 +1,6 @@
 # PerfDog 性能模式：采集口径
 
-QAWork 的默认模式。名字里的 PerfDog 指腾讯的性能测试工具，这里表示“指标口径对齐”，不代表任何隶属或兼容承诺。
+QAWork 的默认模式。名字里的 PerfDog 指腾讯 WeTest 旗下的性能测试工具（竞品页：<https://wetest.qq.com/products/perfdog>），这里表示“指标口径对齐”，不代表任何隶属或兼容承诺。
 
 ## 一次采集的流程
 
