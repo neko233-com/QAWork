@@ -136,8 +136,15 @@ func cmdPerf(args []string) int {
 
 	started := time.Now()
 	samples, err := perf.RunCapture(ctx, sampler, *interval, func(s perf.Sample) {
-		fmt.Fprintf(os.Stderr, "%s fps=%.1f cpu=%.0f%% mem=%.0fMB temp=%.1f°C\n",
+		line := fmt.Sprintf("%s fps=%.1f cpu=%.0f%% mem=%.0fMB temp=%.1f°C",
 			s.At.Format("15:04:05"), s.FPS, s.CPU, s.MemMB, s.TempC)
+		if s.MainThread != "" {
+			line += fmt.Sprintf(" %s=%.0f%% %s=%.0f%%", s.MainThread, s.MainCPU, s.RenderThread, s.RenderCPU)
+		}
+		if s.Engine != "" {
+			line += " engine=" + s.Engine.Label()
+		}
+		fmt.Fprintln(os.Stderr, line)
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "采集失败:", err)
@@ -218,6 +225,13 @@ func cmdReport(args []string) int {
 
 func printSummary(w io.Writer, target string, s perf.Summary, checks []perf.Check, nominal float64) {
 	fmt.Fprintf(w, "目标: %s\n", target)
+	if s.EngineLabel != "" {
+		if s.MainThread != "" {
+			fmt.Fprintf(w, "引擎: %s | %s 峰值 %.0f%% %s 峰值 %.0f%%\n", s.EngineLabel, s.MainThread, s.MainCPUMax, s.RenderThread, s.RenderCPUMax)
+		} else {
+			fmt.Fprintf(w, "引擎: %s\n", s.EngineLabel)
+		}
+	}
 	fmt.Fprintf(w, "采样: %d 个 / %.1f s\n", s.Samples, s.DurationSeconds)
 	fmt.Fprintf(w, "帧率: 均值 %.1f 最低 %.1f | 掉帧 %.0f%%\n", s.FPSMean, s.FPSMin, perf.DropRate(s.FPSMean, nominal))
 	fmt.Fprintf(w, "帧耗时: P50 %.1f ms  P95 %.1f ms  P99 %.1f ms\n", s.FrameP50, s.FrameP95, s.FrameP99)

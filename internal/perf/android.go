@@ -29,6 +29,12 @@ type AndroidSampler struct {
 	prevFrames float64
 	prevJank   float64
 	lastFPS    string
+
+	engine     Engine
+	threadPrev map[int]float64
+	samples    int
+	lastStamp  int64
+	lastTemp   float64
 }
 
 // NewAndroidSampler returns a sampler for Pkg on Serial.
@@ -56,11 +62,24 @@ func (s *AndroidSampler) Start(ctx context.Context) error {
 		return err
 	}
 	s.pid = pid
+	s.engine = DetectEngine(namesOf(s.readThreads(ctx)))
+	s.threadPrev = make(map[int]float64)
 	s.ADB.Shell(ctx, s.Serial, "dumpsys gfxinfo "+s.Pkg+" reset")
 	stat, err := s.readStat(ctx)
 	if err == nil {
 		s.prevCPU = stat.CPUTicks
 		s.prevFrames, s.prevJank = s.readGfx(ctx)
+	}
+	// Prime the latency buffer: the first interval must see it advance,
+	// otherwise the pre-start frames would pass for the current rate.
+	s.layer = PickLayer(s.listLayers(ctx), s.Pkg)
+	if s.layer != "" {
+		out, latErr := s.ADB.Shell(ctx, s.Serial, "dumpsys SurfaceFlinger --latency "+quoteShell(s.layer))
+		if latErr == nil {
+			if _, newest, ok := ParseLatency(out); ok {
+				s.lastStamp = newest
+			}
+		}
 	}
 	s.prevAt = time.Now()
 	return nil
@@ -132,9 +151,11 @@ func firstErr(errs ...error) error {
 	return nil
 }
 
-// frameRate reads SurfaceFlinger's latency buffer for the app's layer; ok
-// is false when the layer is gone, as between activities.
-func (s *AndroidSampler) frameRate(ctx context.Context) (fps float64, note string, ok bool) {
+// frameRate counts the frames SurfaceFlinger presented for the app's layer
+// since the last read, over the host interval: real hit rate, including
+// gaps where the app rendered nothing. ok is false when the layer is gone
+// or the buffer did not advance.
+func (s *AndroidSampler) frameRate(ctx context.Context, dt float64) (fps float64, note string, ok bool) {
 	if s.layer == "" {
 		s.layer = PickLayer(s.listLayers(ctx), s.Pkg)
 	}
@@ -146,12 +167,30 @@ func (s *AndroidSampler) frameRate(ctx context.Context) (fps float64, note strin
 		s.layer = ""
 		return 0, "", false
 	}
-	latencyFPS, ok := ParseLatencyFPS(out)
-	if !ok {
-		s.layer = ""
+	stamps := ParseLatencyStamps(out)
+	if len(stamps) < 2 {
 		return 0, "", false
 	}
-	return latencyFPS, "SurfaceFlinger", true
+	newest := stamps[len(stamps)-1]
+	if s.lastStamp <= 0 || dt <= 0.2 {
+		s.lastStamp = newest
+		return 0, "", false
+	}
+	count := 0
+	for _, stamp := range stamps {
+		if stamp > s.lastStamp {
+			count++
+		}
+	}
+	s.lastStamp = newest
+	if count == 0 {
+		return 0, "", false // nothing new: fall back to gfxinfo
+	}
+	fps = float64(count) / dt
+	if fps > 240 {
+		fps = 240 // the buffer holds 127 frames; the cap is documented
+	}
+	return fps, "SurfaceFlinger", true
 }
 
 func (s *AndroidSampler) listLayers(ctx context.Context) []string {
@@ -164,30 +203,78 @@ func (s *AndroidSampler) listLayers(ctx context.Context) []string {
 
 // PickLayer chooses the layer whose frames represent the app: the
 // SurfaceView a game draws into when there is one, else the app's window.
+// Android 12+ lists layers as "RequestedLayerState{<name> parentId=... z=...}",
+// so the name is extracted before it is handed to --latency.
 func PickLayer(layers []string, pkg string) string {
 	var window string
 	for _, raw := range layers {
-		line := strings.TrimSpace(raw)
-		if line == "" || !strings.Contains(line, pkg) {
+		name := ParseLayerName(raw)
+		if name == "" || !strings.Contains(name, pkg) {
 			continue
 		}
-		if strings.Contains(line, "Background for") || strings.Contains(line, "ActivityRecord") {
+		if strings.Contains(name, "Background for") || strings.Contains(name, "ActivityRecord") {
 			continue
 		}
-		if strings.Contains(line, "SurfaceView[") {
-			return line
+		if strings.Contains(name, "SurfaceView[") {
+			return name
 		}
 		if window == "" {
-			window = line
+			window = name
 		}
 	}
 	return window
 }
 
-// ParseLatencyFPS reads "dumpsys SurfaceFlinger --latency" output: a header
-// of the refresh period, then 127 rows of desired, actual and ready
-// timestamps in nanoseconds. Rows with no actual presentation are skipped.
+// ParseLayerName strips the RequestedLayerState wrapper and the attributes
+// after the layer's own name.
+func ParseLayerName(line string) string {
+	s := strings.TrimSpace(line)
+	if i := strings.IndexByte(s, '{'); i >= 0 {
+		if j := strings.LastIndexByte(s, '}'); j > i {
+			s = s[i+1 : j]
+		}
+	}
+	cut := len(s)
+	for _, marker := range []string{" parentId=", " relativeParentId=", " z="} {
+		if i := strings.Index(s, marker); i > 0 && i < cut {
+			cut = i
+		}
+	}
+	return strings.TrimSpace(s[:cut])
+}
+
+// ParseLatencyFPS reads "dumpsys SurfaceFlinger --latency" output and
+// returns the frame rate over the timestamps it holds.
 func ParseLatencyFPS(out string) (float64, bool) {
+	fps, _, ok := ParseLatency(out)
+	return fps, ok
+}
+
+// ParseLatency reads the latency buffer: a header of the refresh period,
+// then rows of desired, actual and ready timestamps in nanoseconds. It
+// returns the rate over the buffer and the newest presented timestamp, so
+// a caller can tell whether the buffer advanced since the last read.
+func ParseLatency(out string) (fps float64, newest int64, ok bool) {
+	stamps := ParseLatencyStamps(out)
+	if len(stamps) < 4 {
+		return 0, 0, false
+	}
+	span := float64(stamps[len(stamps)-1]-stamps[0]) / 1e9
+	if span <= 0 {
+		return 0, 0, false
+	}
+	fps = float64(len(stamps)-1) / span
+	if fps <= 0 || fps > 1000 {
+		return 0, 0, false
+	}
+	return fps, stamps[len(stamps)-1], true
+}
+
+// ParseLatencyStamps returns the presented timestamps of the buffer, oldest
+// first. Counting the stamps newer than the last read over the host's
+// interval measures the frame rate the app actually hit, including the
+// intervals where it rendered nothing.
+func ParseLatencyStamps(out string) []int64 {
 	var stamps []int64
 	for i, raw := range strings.Split(out, "\n") {
 		line := strings.TrimSpace(raw)
@@ -207,18 +294,7 @@ func ParseLatencyFPS(out string) (float64, bool) {
 		}
 		stamps = append(stamps, actual)
 	}
-	if len(stamps) < 4 {
-		return 0, false
-	}
-	span := float64(stamps[len(stamps)-1]-stamps[0]) / 1e9
-	if span <= 0 {
-		return 0, false
-	}
-	fps := float64(len(stamps)-1) / span
-	if fps <= 0 || fps > 1000 {
-		return 0, false
-	}
-	return fps, true
+	return stamps
 }
 
 func (s *AndroidSampler) readGfx(ctx context.Context) (frames, jank float64) {
@@ -289,6 +365,8 @@ func (s *AndroidSampler) Sample(ctx context.Context) (Sample, error) {
 		}
 		s.pid = pid
 		s.prevAt = time.Time{}
+		s.engine = EngineUnknown
+		s.threadPrev = nil
 	}
 	stat, err := s.readStat(ctx)
 	if err != nil {
@@ -310,7 +388,22 @@ func (s *AndroidSampler) Sample(ctx context.Context) (Sample, error) {
 	sample.MemMB = float64(stat.RSSPages) * 4096 / (1024 * 1024)
 	sample.Threads = stat.Threads
 
-	fps, note, ok := s.frameRate(ctx)
+	// Per-engine threads: Unity's main and GPU device thread, UE's game and
+	// render thread. Names come from the process itself, so release builds
+	// need no hook and no debuggable APK.
+	threads := s.readThreads(ctx)
+	s.samples++
+	if s.engine == EngineUnknown || s.samples%10 == 0 {
+		if detected := DetectEngine(namesOf(threads)); detected != EngineNative || s.engine == EngineUnknown {
+			s.engine = detected
+		}
+	}
+	s.fillThreadCPU(threads, &sample, dt)
+	if s.engine != EngineUnknown {
+		sample.Engine = s.engine
+	}
+
+	fps, note, ok := s.frameRate(ctx, dt)
 	if !ok {
 		frames, jank := s.readGfx(ctx)
 		if !s.prevAt.IsZero() && dt > 0.2 && frames >= s.prevFrames {
@@ -322,6 +415,9 @@ func (s *AndroidSampler) Sample(ctx context.Context) (Sample, error) {
 			note = "gfxinfo"
 		}
 		s.prevFrames, s.prevJank = frames, jank
+		if fps <= 0 && note == "" {
+			note = "无新帧"
+		}
 		if fps < 0 {
 			fps = 0
 		}
@@ -343,10 +439,63 @@ func (s *AndroidSampler) Sample(ctx context.Context) (Sample, error) {
 		sample.FrameMS = round2(1000 / fps)
 	}
 	sample.JankPct = round2(clamp(sample.JankPct, 0, 100))
-	sample.TempC = round2(s.temperature(ctx))
+	temp := s.temperature(ctx)
+	if temp > 0 {
+		s.lastTemp = temp
+	} else {
+		temp = s.lastTemp
+	}
+	sample.TempC = round2(temp)
 	sample.Note = note
 	s.lastFPS = note
 	return sample, nil
+}
+
+// readThreads lists the target's threads and their cumulative CPU ticks.
+// /proc/<pid>/task is readable for other apps on Android; the CPU tick
+// delta turns into a per-thread share that names the engine's key threads.
+func (s *AndroidSampler) readThreads(ctx context.Context) []threadStat {
+	cmd := fmt.Sprintf("for t in /proc/%d/task/*; do echo @@$(cat $t/comm)@@$(cat $t/stat); done", s.pid)
+	out, err := s.ADB.Shell(ctx, s.Serial, cmd)
+	if err != nil {
+		return nil
+	}
+	return ParseThreadStats(out)
+}
+
+// fillThreadCPU computes the interval's CPU share for the engine's main and
+// render threads, and labels the sample with what it found.
+func (s *AndroidSampler) fillThreadCPU(stats []threadStat, sample *Sample, dt float64) {
+	if s.threadPrev == nil {
+		s.threadPrev = make(map[int]float64)
+	}
+	cpus := make(map[int]float64, len(stats))
+	for _, st := range stats {
+		delta := 0.0
+		if prev, ok := s.threadPrev[st.TID]; ok && dt > 0.2 {
+			delta = st.Ticks - prev
+			if delta < 0 {
+				delta = 0
+			}
+		}
+		s.threadPrev[st.TID] = st.Ticks
+		if dt > 0.2 {
+			cpus[st.TID] = clamp(delta/100/dt*100, 0, 100)
+		}
+	}
+	key := s.engine.Threads()
+	if key.Main != "" {
+		if st, ok := keyThread(stats, key.Main); ok {
+			sample.MainThread = key.Main
+			sample.MainCPU = round2(cpus[st.TID])
+		}
+	}
+	if key.Render != "" {
+		if st, ok := keyThread(stats, key.Render); ok {
+			sample.RenderThread = key.Render
+			sample.RenderCPU = round2(cpus[st.TID])
+		}
+	}
 }
 
 func (s *AndroidSampler) cores(ctx context.Context) float64 {

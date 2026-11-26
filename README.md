@@ -73,6 +73,22 @@ qawork report -csv run.csv -min-fps 50 -max-jank 5                 # 只汇总�
 
 细节与已知边界见 [docs/perfdog-mode.md](docs/perfdog-mode.md)。
 
+## 引擎支持（Unity / UE5）
+
+不注入引擎、不改包、不需要可调试 APK，靠进程自己的线程名识别：
+
+| 引擎 | 识别依据 | 主线程 | 渲染线程 |
+| --- | --- | --- | --- |
+| Unity | `UnityMain` / `UnityGfxDeviceW` | `UnityMain` | `UnityGfxDeviceW` |
+| UE5（含 5.8） | `GameThread`（配 `RenderThread`/`RHIThread`） | `GameThread` | `RenderThread`，无则 `RHIThread` |
+| 原生 | 以上都不命中 | — | — |
+
+识别到引擎后，CSV 多出 `engine/main_thread/main_cpu/render_thread/render_cpu` 五列，CLI 逐样本和汇总都会打印主/渲线程的单核 CPU 占比；UI 侧栏显示引擎 badge，表格有"主/渲"列。没识别到就留空，显示 `—`，不猜。
+
+Android 的线程名会被截断（`comm` 只有 15 字符，某些 ROM 留尾），匹配做了前后缀容错，并只对 8 字符以上的名字容错，避免把 `main` 误认成 `UnityMain`。
+
+**UE5.8 只到线程与帧层口径**：不解析 `stat unit`、不探测引擎版本、不接 Unity Profiler。细节和验收现状见 [docs/engines.md](docs/engines.md)。
+
 ## 门禁
 
 默认阈值：平均 FPS ≥ 48、卡顿帧 ≤ 5%、CPU ≤ 70%、内存 ≤ 1024 MB、温度 ≤ 45 °C。

@@ -40,6 +40,7 @@ GUI 和 CLI 必须共用同一份采样与 CSV 口径，否则"窗口里看到�
 - 没接的数据不许编。兼容性、自动化面板写"规划中"，不摆假报表、假设备。
 - 采集不到帧率的目标（PC 进程）标记为"无帧率来源"，门禁跳过帧率检查，并在 UI/CLI 明确写出来。
 - 新增指标必须在 `docs/perfdog-mode.md` 写清来源、单位、已知边界。
+- 引擎识别与线程口径以 `docs/engines.md` 为准：Unity 认 `UnityMain`/`UnityGfxDeviceW`，UE5 认 `GameThread`/`RenderThread`/`RHIThread`，未命中写 `native`，不许猜引擎。引擎名匹配必须保留"只对 ≥8 字符名字做前后缀容错"，否则 `main` 会误配 `UnityMain`。
 
 ## 在 Windows 上必须做的验证
 

@@ -10,8 +10,13 @@ import (
 	"time"
 )
 
-// csvHeader is the order of the columns in the CSV QAWork writes.
-var csvHeader = []string{"at", "fps", "frame_ms", "jank_pct", "cpu_pct", "mem_mb", "temp_c", "threads", "note"}
+// csvHeader is the order of the columns in the CSV QAWork writes. Engine
+// columns come before note so a human reading the file sees the metric next
+// to its source.
+var csvHeader = []string{
+	"at", "fps", "frame_ms", "jank_pct", "cpu_pct", "mem_mb", "temp_c", "threads",
+	"engine", "main_thread", "main_cpu", "render_thread", "render_cpu", "note",
+}
 
 // WriteCSV writes samples as RFC 4180 CSV with one header row.
 func WriteCSV(w io.Writer, samples []Sample) error {
@@ -24,7 +29,9 @@ func WriteCSV(w io.Writer, samples []Sample) error {
 			s.At.Format(time.RFC3339Nano),
 			formatFloat(s.FPS), formatFloat(s.FrameMS), formatFloat(s.JankPct),
 			formatFloat(s.CPU), formatFloat(s.MemMB), formatFloat(s.TempC),
-			strconv.Itoa(s.Threads), s.Note,
+			strconv.Itoa(s.Threads),
+			string(s.Engine), s.MainThread, formatFloat(s.MainCPU), s.RenderThread, formatFloat(s.RenderCPU),
+			s.Note,
 		}
 		if err := cw.Write(rec); err != nil {
 			return err
@@ -55,6 +62,13 @@ func ReadCSV(r io.Reader) ([]Sample, error) {
 	if len(rows) == 0 {
 		return nil, fmt.Errorf("CSV 为空")
 	}
+	hasEngine := false
+	for _, h := range rows[0] {
+		if h == "engine" {
+			hasEngine = true
+			break
+		}
+	}
 	var samples []Sample
 	for i, row := range rows {
 		if i == 0 {
@@ -75,7 +89,18 @@ func ReadCSV(r io.Reader) ([]Sample, error) {
 		s.MemMB = parseFloat(row[5])
 		s.TempC = parseFloat(row[6])
 		s.Threads = int(parseFloat(row[7]))
-		if len(row) > 8 {
+		if hasEngine && len(row) >= 13 {
+			s.Engine = Engine(row[8])
+			s.MainThread = row[9]
+			s.MainCPU = parseFloat(row[10])
+			s.RenderThread = row[11]
+			s.RenderCPU = parseFloat(row[12])
+			if len(row) > 13 {
+				s.Note = row[13]
+			}
+		} else if len(row) > 8 {
+			// CSV written by QAWork 0.1.0 and earlier: note directly follows
+			// the thread count.
 			s.Note = row[8]
 		}
 		samples = append(samples, s)

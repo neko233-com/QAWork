@@ -23,7 +23,18 @@ type Sample struct {
 	MemMB   float64   `json:"mem_mb"`
 	TempC   float64   `json:"temp_c"`
 	Threads int       `json:"threads"`
-	Note    string    `json:"note,omitempty"`
+
+	// Engine is what the target's threads say it runs: Unity, UE5, or
+	// native. Main and Render are that engine's key threads, with their
+	// CPU share for this interval, so a Unity or UE5 run answers "主线程
+	// 卡不卡" and not only "进程多忙".
+	Engine       Engine  `json:"engine,omitempty"`
+	MainThread   string  `json:"main_thread,omitempty"`
+	MainCPU      float64 `json:"main_cpu"`
+	RenderThread string  `json:"render_thread,omitempty"`
+	RenderCPU    float64 `json:"render_cpu"`
+
+	Note string `json:"note,omitempty"`
 }
 
 // Summary aggregates a capture. Percentiles are of frame time, the way
@@ -42,6 +53,13 @@ type Summary struct {
 	CPUMean         float64 `json:"cpu_mean"`
 	MemMaxMB        float64 `json:"mem_max_mb"`
 	TempMax         float64 `json:"temp_max"`
+
+	Engine       Engine  `json:"engine,omitempty"`
+	EngineLabel  string  `json:"engine_label,omitempty"`
+	MainThread   string  `json:"main_thread,omitempty"`
+	RenderThread string  `json:"render_thread,omitempty"`
+	MainCPUMax   float64 `json:"main_cpu_max"`
+	RenderCPUMax float64 `json:"render_cpu_max"`
 }
 
 // Summarize aggregates samples. A zero FPS sample means the app rendered
@@ -57,6 +75,22 @@ func Summarize(samples []Sample) Summary {
 	var fpsCount int
 	var frames []float64
 	for _, v := range samples {
+		if v.Engine != "" {
+			s.Engine = v.Engine
+			s.EngineLabel = v.Engine.Label()
+		}
+		if v.MainThread != "" {
+			s.MainThread = v.MainThread
+		}
+		if v.RenderThread != "" {
+			s.RenderThread = v.RenderThread
+		}
+		if v.MainCPU > s.MainCPUMax {
+			s.MainCPUMax = v.MainCPU
+		}
+		if v.RenderCPU > s.RenderCPUMax {
+			s.RenderCPUMax = v.RenderCPU
+		}
 		if v.FPS > 0 {
 			fpsCount++
 			s.FPSMean += v.FPS

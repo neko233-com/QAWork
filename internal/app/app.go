@@ -304,6 +304,16 @@ func sessionName(serial, target string) string {
 	return fmt.Sprintf("%s-%s-%s.csv", clean(serial), clean(target), time.Now().Format("20060102-150405"))
 }
 
+// Latest returns the most recent sample, if any.
+func (a *App) Latest() (perf.Sample, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.samples) == 0 {
+		return perf.Sample{}, false
+	}
+	return a.samples[len(a.samples)-1], true
+}
+
 // Summary aggregates what has been sampled so far, for the live cards.
 func (a *App) Summary() perf.Summary {
 	return perf.Summarize(a.Snapshot())
@@ -380,6 +390,21 @@ func (a *App) sidebar(c *ui.Context, tk *theme.Tokens) {
 		ui.Text(c, "目标包名 / 进程名").FontSize(12).TextColor(tk.TextSecondary)
 		ui.TextInput(c, &a.Target).Placeholder("com.example.game 或 Game.exe")
 
+		if last, ok := a.Latest(); ok {
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "引擎").FontSize(11).TextColor(tk.TextTertiary)
+				if last.Engine == "" {
+					ui.Badge(c, "未识别")
+				} else {
+					ui.Badge(c, last.Engine.Label())
+				}
+			})
+			if last.MainThread != "" {
+				ui.Text(c, fmt.Sprintf("%s %.0f%% · %s %.0f%%", last.MainThread, last.MainCPU, last.RenderThread, last.RenderCPU)).
+					FontSize(11).TextColor(tk.TextSecondary).Wrap()
+			}
+		}
+
 		ui.Text(c, "采样间隔").FontSize(12).TextColor(tk.TextSecondary)
 		ui.Select(c, &a.IntervalLabel, []string{"500 ms", "1 s", "2 s"})
 
@@ -443,7 +468,11 @@ func (a *App) perfPanel(c *ui.Context, tk *theme.Tokens) {
 		a.statCard(c, tk, "掉帧率", dropText, hintDrop, tk.Warning)
 		a.statCard(c, tk, "帧耗时 P95", frameText, hintFrame, tk.Info)
 		a.statCard(c, tk, "卡顿帧", jankText, hintJank, tk.Warning)
-		a.statCard(c, tk, "CPU 峰值", fmt.Sprintf("%.0f%%", s.CPUMax), fmt.Sprintf("均值 %.0f%%", s.CPUMean), tk.Primary)
+		cpuHint := fmt.Sprintf("均值 %.0f%%", s.CPUMean)
+		if s.MainThread != "" {
+			cpuHint = fmt.Sprintf("主 %.0f%% / 渲 %.0f%%", s.MainCPUMax, s.RenderCPUMax)
+		}
+		a.statCard(c, tk, "CPU 峰值", fmt.Sprintf("%.0f%%", s.CPUMax), cpuHint, tk.Primary)
 		a.statCard(c, tk, "内存峰值", fmt.Sprintf("%.0f MB", s.MemMaxMB), fmt.Sprintf("温度峰值 %.0f°C", s.TempMax), tk.Primary)
 	})
 
@@ -533,7 +562,7 @@ func (a *App) sampleTable(c *ui.Context, tk *theme.Tokens, samples []perf.Sample
 		{Title: "CPU", Width: 62},
 		{Title: "内存", Width: 80},
 		{Title: "温度", Width: 62},
-		{Title: "线程", Width: 58},
+		{Title: "主/渲", Width: 88},
 		{Title: "来源", Width: 160},
 	}
 	rows := make([]perf.Sample, 0, tableSamples)
@@ -548,7 +577,12 @@ func (a *App) sampleTable(c *ui.Context, tk *theme.Tokens, samples []perf.Sample
 		func(s perf.Sample) string { return fmt.Sprintf("%.0f%%", s.CPU) },
 		func(s perf.Sample) string { return fmt.Sprintf("%.0f MB", s.MemMB) },
 		func(s perf.Sample) string { return fmt.Sprintf("%.0f°C", s.TempC) },
-		func(s perf.Sample) string { return fmt.Sprintf("%d", s.Threads) },
+		func(s perf.Sample) string {
+			if s.MainThread == "" && s.RenderThread == "" {
+				return "—"
+			}
+			return fmt.Sprintf("%.0f/%.0f%%", s.MainCPU, s.RenderCPU)
+		},
 		func(s perf.Sample) string { return s.Note },
 	}
 	ui.Table(c, &a.table, columns, len(rows), func(row, col int) {

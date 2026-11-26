@@ -100,15 +100,78 @@ emulator-5554 offline
 
 func TestPickLayer(t *testing.T) {
 	layers := []string{
-		"Background for com.example.game/com.example.game.MainActivity",
-		"com.example.game/com.example.game.MainActivity#0",
-		"SurfaceView[com.example.game/com.example.game.MainActivity]#0",
+		"RequestedLayerState{Background for com.example.game/com.example.game.MainActivity#1 parentId=2 z=1}",
+		"RequestedLayerState{com.example.game/com.example.game.MainActivity#0 parentId=1 z=0}",
+		"RequestedLayerState{SurfaceView[com.example.game/com.example.game.MainActivity]#0 parentId=1 z=0}",
 	}
 	if got := PickLayer(layers, "com.example.game"); got != "SurfaceView[com.example.game/com.example.game.MainActivity]#0" {
 		t.Errorf("layer = %q", got)
 	}
-	if got := PickLayer([]string{"com.other/app#0"}, "com.example.game"); got != "" {
+	if got := PickLayer([]string{"RequestedLayerState{com.other/app#0 parentId=3 z=1}"}, "com.example.game"); got != "" {
 		t.Errorf("layer = %q, want empty", got)
+	}
+}
+
+func TestParseLayerName(t *testing.T) {
+	cases := map[string]string{
+		"RequestedLayerState{com.android.settings/com.android.settings.Settings#330 parentId=329}": "com.android.settings/com.android.settings.Settings#330",
+		"RequestedLayerState{com.x/Activity#2 parentId=1 relativeParentId=9 z=-2147483648}":        "com.x/Activity#2",
+		"com.x/Activity#2": "com.x/Activity#2",
+	}
+	for in, want := range cases {
+		if got := ParseLayerName(in); got != want {
+			t.Errorf("ParseLayerName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestDetectEngine(t *testing.T) {
+	unity := []string{"ndroid.settings", "UnityMain", "UnityGfxDeviceW", "Job.Worker 0"}
+	if got := DetectEngine(unity); got != EngineUnity {
+		t.Errorf("unity = %v", got)
+	}
+	ue := []string{"GameThread", "RenderThread", "RHIThread", "TaskGraphThread 0"}
+	if got := DetectEngine(ue); got != EngineUE {
+		t.Errorf("ue = %v", got)
+	}
+	if got := DetectEngine([]string{"main", "Signal Catcher"}); got != EngineNative {
+		t.Errorf("native = %v", got)
+	}
+	// comm may be truncated from the left on some vendors.
+	if got := DetectEngine([]string{"nityGfxDeviceW"}); got != EngineUnity {
+		t.Errorf("truncated unity = %v", got)
+	}
+}
+
+func TestParseThreadStats(t *testing.T) {
+	out := "@@UnityMain@@123 (UnityMain) S 1 2 3 4 5 6 7 8 9 10 120 45 0 0 0 0 14 0 0 0 0 0\n" +
+		"@@UnityGfxDeviceW@@124 (UnityGfxDeviceW) S 1 2 3 4 5 6 7 8 9 10 200 30 0 0 0 0 12 0 0 0 0 0\n" +
+		"garbage\n"
+	stats := ParseThreadStats(out)
+	if len(stats) != 2 {
+		t.Fatalf("stats = %v", stats)
+	}
+	if stats[0].Name != "UnityMain" || stats[0].Ticks != 165 || stats[0].TID != 123 {
+		t.Errorf("first = %+v", stats[0])
+	}
+	if stats[1].Name != "UnityGfxDeviceW" || stats[1].Ticks != 230 {
+		t.Errorf("second = %+v", stats[1])
+	}
+}
+
+func TestKeyThread(t *testing.T) {
+	stats := []threadStat{
+		{TID: 1, Name: "UnityMain", Ticks: 10},
+		{TID: 2, Name: "UnityGfxDeviceW", Ticks: 20},
+	}
+	if st, ok := keyThread(stats, "UnityMain"); !ok || st.TID != 1 {
+		t.Errorf("main = %+v ok=%v", st, ok)
+	}
+	if st, ok := keyThread(stats, "UnityGfxDeviceW"); !ok || st.TID != 2 {
+		t.Errorf("render = %+v ok=%v", st, ok)
+	}
+	if _, ok := keyThread(stats, "GameThread"); ok {
+		t.Error("GameThread should not match")
 	}
 }
 
@@ -168,7 +231,8 @@ func TestDropRate(t *testing.T) {
 func TestCSVRoundTrip(t *testing.T) {
 	base := time.Now().Truncate(time.Millisecond)
 	samples := []Sample{
-		{At: base, FPS: 59.5, FrameMS: 16.8, JankPct: 1.2, CPU: 33.3, MemMB: 512.4, TempC: 38.5, Threads: 42, Note: "SurfaceFlinger"},
+		{At: base, FPS: 59.5, FrameMS: 16.8, JankPct: 1.2, CPU: 33.3, MemMB: 512.4, TempC: 38.5, Threads: 42, Note: "SurfaceFlinger",
+			Engine: EngineUnity, MainThread: "UnityMain", MainCPU: 31.2, RenderThread: "UnityGfxDeviceW", RenderCPU: 18.4},
 		{At: base.Add(time.Second), FPS: 0, Note: "idle, 空闲"},
 	}
 	var buf bytes.Buffer
@@ -184,6 +248,9 @@ func TestCSVRoundTrip(t *testing.T) {
 	}
 	if !got[0].At.Equal(samples[0].At) || got[0].FPS != 59.5 || got[0].Threads != 42 || got[0].Note != "SurfaceFlinger" {
 		t.Errorf("first = %+v", got[0])
+	}
+	if got[0].Engine != EngineUnity || got[0].MainThread != "UnityMain" || got[0].MainCPU != 31.2 || got[0].RenderCPU != 18.4 {
+		t.Errorf("engine fields = %+v", got[0])
 	}
 	if got[1].FPS != 0 || got[1].Note != "idle, 空闲" {
 		t.Errorf("second = %+v", got[1])
