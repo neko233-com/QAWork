@@ -6,6 +6,7 @@ require (
 	github.com/egoist/mygo v0.10.0
 	github.com/lobehub/lobe-mygo v0.0.0-20261116124832-d88b4ad7f238
 	golang.org/x/sys v0.48.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

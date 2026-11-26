@@ -86,6 +86,24 @@ func ADBPath() string {
 	if p, err := exec.LookPath("adb"); err == nil {
 		return p
 	}
+	for _, env := range []string{"ANDROID_SDK_ROOT", "ANDROID_HOME"} {
+		if root := os.Getenv(env); root != "" {
+			p := filepath.Join(root, "platform-tools", exe("adb"))
+			if fileExists(p) {
+				return p
+			}
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		if home, err := os.UserHomeDir(); err == nil {
+			for _, dir := range []string{"Library/Android/sdk", "Android/Sdk"} {
+				p := filepath.Join(home, filepath.FromSlash(dir), "platform-tools", "adb")
+				if fileExists(p) {
+					return p
+				}
+			}
+		}
+	}
 	if local := os.Getenv("LOCALAPPDATA"); local != "" {
 		p := filepath.Join(local, "Android", "Sdk", "platform-tools", exe("adb"))
 		if fileExists(p) {
@@ -144,13 +162,23 @@ func Inspect(ctx context.Context) Report {
 		})
 	}
 
-	report.Deps = append(report.Deps, Dep{
-		ID: "usb-driver", Name: "Android USB 驱动", Required: false,
-		Description: "Windows 识别不到手机时用；不同厂商（Google、小米、OPPO、vivo…）各装各的。",
-		Status:      StatusManual,
-		Installable: false,
-		Note:        "需手动安装：QAWork 不代装驱动，也不改系统驱动配置。装完在设备管理器里确认没有感叹号。",
-	})
+	if runtime.GOOS == "darwin" {
+		report.Deps = append(report.Deps, Dep{
+			ID: "usb-driver", Name: "USB 连接", Required: false,
+			Description: "macOS 自带 Android USB 驱动，不需要厂商驱动；手机选“文件传输”即可被 adb 识别。",
+			Status:      StatusOK,
+			Installable: false,
+			Note:        "macOS 免驱；如果 adb 看不到设备，先换线或执行 adb kill-server 后重插。",
+		})
+	} else {
+		report.Deps = append(report.Deps, Dep{
+			ID: "usb-driver", Name: "Android USB 驱动", Required: false,
+			Description: "Windows 识别不到手机时用；不同厂商（Google、小米、OPPO、vivo…）各装各的。",
+			Status:      StatusManual,
+			Installable: false,
+			Note:        "需手动安装：QAWork 不代装驱动，也不改系统驱动配置。装完在设备管理器里确认没有感叹号。",
+		})
+	}
 	report.Summary = summarize(report.Deps)
 	return report
 }

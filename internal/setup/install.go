@@ -9,13 +9,23 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
 const (
-	platformToolsURL = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
-	scrcpyAPI        = "https://api.github.com/repos/Genymobile/scrcpy/releases/latest"
+	scrcpyAPI = "https://api.github.com/repos/Genymobile/scrcpy/releases/latest"
 )
+
+var platformToolsURL = platformToolsURLFor(runtime.GOOS)
+
+// platformToolsURLFor picks Google's official zip for the host.
+func platformToolsURLFor(goos string) string {
+	if goos == "darwin" {
+		return "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip"
+	}
+	return "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
+}
 
 // Install installs one dependency by id: adb or scrcpy. addPath decides
 // whether the installed directory is appended to the current user's PATH.
@@ -65,6 +75,7 @@ func installADB(ctx context.Context, addPath bool, progress func(string)) (Dep, 
 	if !fileExists(adb) {
 		return Dep{}, fmt.Errorf("解压后没有找到 %s", adb)
 	}
+	markExecutable(dir)
 	if addPath {
 		progress("写入当前用户 PATH…")
 		if err := AddUserPath(dir); err != nil {
@@ -122,6 +133,7 @@ func installScrcpy(ctx context.Context, addPath bool, progress func(string)) (De
 	if !fileExists(filepath.Join(dir, exe("scrcpy"))) {
 		return Dep{}, fmt.Errorf("解压后没有找到 scrcpy，release 结构可能变了")
 	}
+	markExecutable(dir)
 	if addPath {
 		progress("写入当前用户 PATH…")
 		if err := AddUserPath(dir); err != nil {
@@ -136,7 +148,7 @@ func installScrcpy(ctx context.Context, addPath bool, progress func(string)) (De
 	return Dep{ID: "scrcpy", Name: "scrcpy", Status: StatusOK, Installable: true}, nil
 }
 
-// latestScrcpy picks the win64 zip of the newest scrcpy release.
+// latestScrcpy picks the zip matching this host.
 func latestScrcpy(ctx context.Context) (string, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, scrcpyAPI, nil)
 	if err != nil {
@@ -159,15 +171,56 @@ func latestScrcpy(ctx context.Context) (string, string, error) {
 	return pickScrcpyAsset(r)
 }
 
-// pickScrcpyAsset selects the win64 zip of a release.
+// pickScrcpyAsset selects the asset for this host.
 func pickScrcpyAsset(r release) (string, string, error) {
+	return pickScrcpyAssetFor(r, runtime.GOOS, runtime.GOARCH)
+}
+
+// pickScrcpyAssetFor selects win64 on Windows and macos-aarch64 on Apple
+// Silicon. A plain macos zip is accepted only if no arm64 asset exists.
+func pickScrcpyAssetFor(r release, goos, goarch string) (string, string, error) {
+	var fallback asset
 	for _, a := range r.Assets {
 		name := strings.ToLower(a.Name)
-		if strings.Contains(name, "win64") && strings.HasSuffix(name, ".zip") {
-			return a.URL, r.TagName, nil
+		if !strings.HasSuffix(name, ".zip") {
+			continue
+		}
+		switch goos {
+		case "windows":
+			if strings.Contains(name, "win64") {
+				return a.URL, r.TagName, nil
+			}
+		case "darwin":
+			if !strings.Contains(name, "macos") {
+				continue
+			}
+			if strings.Contains(name, "aarch64") || strings.Contains(name, "arm64") {
+				return a.URL, r.TagName, nil
+			}
+			if !strings.Contains(name, "x86") && !strings.Contains(name, "intel") {
+				fallback = a
+			}
 		}
 	}
-	return "", "", fmt.Errorf("release %s 没有 win64 zip", r.TagName)
+	if fallback.URL != "" && goarch == "arm64" {
+		return fallback.URL, r.TagName, nil
+	}
+	return "", "", fmt.Errorf("release %s 没有 %s/%s 的 zip", r.TagName, goos, goarch)
+}
+
+// markExecutable restores the +x bit lost by archive extraction. Windows
+// ignores modes, so this is a no-op there.
+func markExecutable(dir string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		_ = os.Chmod(path, 0o755)
+		return nil
+	})
 }
 
 // download fetches url to dst and reports bytes as they arrive.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -96,7 +97,7 @@ func TestToolsList(t *testing.T) {
 	m, _ := handleJSON(t, NewServer(), `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
 	result := m["result"].(map[string]any)
 	tools, ok := result["tools"].([]any)
-	if !ok || len(tools) < 4 {
+	if !ok || len(tools) < 7 {
 		t.Fatalf("tools = %v", result)
 	}
 	names := map[string]bool{}
@@ -107,7 +108,10 @@ func TestToolsList(t *testing.T) {
 			t.Errorf("tool %v has no schema", tool["name"])
 		}
 	}
-	for _, want := range []string{"qawork_devices", "qawork_perf", "qawork_report", "qawork_doctor"} {
+	for _, want := range []string{
+		"qawork_devices", "qawork_perf", "qawork_report", "qawork_doctor",
+		"qawork_validate_plan", "qawork_run_plan", "qawork_compat_matrix",
+	} {
 		if !names[want] {
 			t.Errorf("missing tool %s", want)
 		}
@@ -272,6 +276,10 @@ func TestDoctorWithoutADB(t *testing.T) {
 	t.Setenv("QAWORK_ADB", "")
 	t.Setenv("PATH", "")
 	t.Setenv("LOCALAPPDATA", t.TempDir())
+	t.Setenv("ANDROID_HOME", "")
+	t.Setenv("ANDROID_SDK_ROOT", "")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
 	result, err := toolDoctor(context.Background(), map[string]any{})
 	if err != nil {
 		t.Fatal(err)
@@ -290,5 +298,78 @@ func TestNextStepReady(t *testing.T) {
 	step := nextStep([]setup.Dep{{ID: "adb", Required: true, Status: setup.StatusOK}})
 	if !strings.Contains(step, "环境就绪") {
 		t.Errorf("step = %q", step)
+	}
+}
+
+func findTool(t *testing.T, name string) *Tool {
+	t.Helper()
+	s := NewServer()
+	for i := range s.Tools {
+		if s.Tools[i].Name == name {
+			return &s.Tools[i]
+		}
+	}
+	t.Fatalf("tool %s missing", name)
+	return nil
+}
+
+func TestValidatePlanTool(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qawork.yaml")
+	if err := os.WriteFile(path, []byte("version: 1\ncases:\n  - name: smoke\n    package: com.a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := findTool(t, "qawork_validate_plan")
+	result, err := tool.Run(context.Background(), map[string]any{"plan": path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := result.(map[string]any)
+	if m["valid"] != true {
+		t.Errorf("result = %+v", m)
+	}
+	cases := m["cases"].([]string)
+	if len(cases) != 1 || cases[0] != "smoke" {
+		t.Errorf("cases = %v", cases)
+	}
+}
+
+func TestValidatePlanToolReportsErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad.yaml")
+	if err := os.WriteFile(path, []byte("version: 2\ncases: []\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tool := findTool(t, "qawork_validate_plan")
+	result, err := tool.Run(context.Background(), map[string]any{"plan": path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := result.(map[string]any)
+	if m["valid"] != false {
+		t.Errorf("result = %+v", m)
+	}
+	if errs, _ := m["errors"].([]string); len(errs) == 0 {
+		t.Errorf("errors = %v", m["errors"])
+	}
+}
+
+func TestCompatToolRequiresPackageWithoutPlan(t *testing.T) {
+	tool := findTool(t, "qawork_compat_matrix")
+	if _, err := tool.Run(context.Background(), map[string]any{}); err == nil ||
+		!strings.Contains(err.Error(), "package") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestArgStringSlice(t *testing.T) {
+	args := map[string]any{"devices": []any{"a", " b ", 3}}
+	if got := argStringSlice(args, "devices"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("slice = %v", got)
+	}
+	args = map[string]any{"devices": "a, b ,"}
+	if got := argStringSlice(args, "devices"); len(got) != 2 {
+		t.Errorf("string = %v", got)
+	}
+	if got := argStringSlice(map[string]any{}, "devices"); got != nil {
+		t.Errorf("missing = %v", got)
 	}
 }

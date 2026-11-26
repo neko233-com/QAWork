@@ -7,15 +7,15 @@ QAWork 的工程规则。改代码前先读这一页。
 - **Go 1.27+，纯 Go，`CGO_ENABLED=0`**。不允许 `import "C"`，不允许 C/C++ 构建依赖。
 - **构建硬约束**：所有构建、测试、CI 都显式 `CGO_ENABLED=0`；验证时 `go env CGO_ENABLED` 必须是 `0`。引入 cgo 的 PR 直接拒，不讨论"临时开一下"。
 - **原生 UI**：`github.com/egoist/mygo`（`ui.View` / `ui.Context`）+ `github.com/lobehub/lobe-mygo/pkg/theme`（设计令牌）。不用 WebView、HTML、CSS、JS。
-- **发布目标**：`windows/amd64` 的 `qawork.exe` 与 `qawork-gui.exe`，产物进 `dist/`。macOS 不是当前验收目标。
+- **发布目标**：`windows/amd64` 与 `darwin/arm64`，各出 `qawork` / `qawork-gui`，产物进 `dist/`。只支持这两个宿主平台，不上 Linux/32 位；当前开发机是 Windows 时只做 Windows 真实验证，macOS 由 CI + 真机补。
 
 ## 工作模式（固定，不许漂移）
 
 | # | 模式 | 状态 | 竞品/口径 |
 | --- | --- | --- | --- |
 | 0 | **PerfDog 性能**（默认） | 可用 | 竞品：[腾讯 PerfDog](https://wetest.qq.com/products/perfdog)，只对齐采集口径 |
-| 1 | 兼容性 | 规划中 | 本地设备农场矩阵，对标 WeTest 云真机的场景，不属于 PerfDog 能力 |
-| 2 | 自动化 | 规划中 | `qawork.yaml` + adb 回放 + 性能门禁 |
+| 1 | 兼容性 | 可用 | 批量安装/冷启/矩阵，对标 WeTest 云真机的场景，不属于 PerfDog 能力 |
+| 2 | 自动化 | 可用 | `qawork.yaml` + adb 回放 + 性能门禁 |
 
 规则：
 
@@ -28,19 +28,22 @@ QAWork 的工程规则。改代码前先读这一页。
 
 | 包 | 职责 | 不许做 |
 | --- | --- | --- |
-| `internal/perf` | 采样器（Android adb / 本地进程）、统计、CSV、门禁 | 依赖 UI 包 |
+| `internal/perf` | 采样器（Android adb / Windows 与 macOS 本机进程）、统计、CSV、门禁 | 依赖 UI 包 |
+| `internal/automation` | `qawork.yaml` 解析/校验、adb 步骤、单 case 执行、产物 | 依赖 UI 包；另写一份采样器 |
+| `internal/compat` | 多设备矩阵、APK 安装、设备信息、logcat crash/ANR、矩阵导出 | 依赖 UI 包；伪造兼容结果 |
 | `internal/app` | 工作台状态与视图 | 直接 `exec adb`（走 `perf.ADB`） |
-| `cmd/qawork` | 无头 CLI，CI 用 | 复制一份采样逻辑 |
+| `cmd/qawork` | 无头 CLI，CI 用 | 复制一份采样/自动化逻辑 |
 | `cmd/qawork-gui` | 窗口入口 | 业务逻辑 |
 
-GUI 和 CLI 必须共用同一份采样与 CSV 口径，否则"窗口里看到的"和"CI 判的"会打架。
+GUI 和 CLI 必须共用同一份采样与 CSV 口径，否则"窗口里看到的"和"CI 判的"会打架。自动化只允许经 `automation.Execute` 编排，兼容只允许经 `compat.Run`，GUI/CLI/MCP 不许各写一套。
 
 ## Agent 接口（CLI / MCP）
 
-- CLI 的 `devices` / `perf` / `report` / `setup` 都必须支持 `-json`，门禁失败退出码 2，环境缺必装项退出码 2。
+- CLI 的 `devices` / `perf` / `report` / `setup` / `run` / `compat` 都必须支持 `-json`；门禁/兼容失败退出码 2，环境缺必装项退出码 2，执行错误退出码 1。
+- `qawork.yaml` 的步骤只允许 `launch`（仅第一步）/ `wait` / `tap` / `swipe` / `keyevent` / `text`（仅 ASCII）/ `screenshot`；`launch` 在采样前执行，放在后面会让 PID 失效。阈值 nil=继承、显式 0=关闭。
 - `internal/mcp` 是唯一的 MCP 实现，stdio JSON-RPC 2.0；**stdout 只准写协议帧**，日志/进度一律 stderr。
-- MCP 只暴露 `qawork_doctor` / `qawork_devices` / `qawork_perf` / `qawork_report`，不提供任意 shell/adb 透传。
-- MCP 工具与 CLI 共用 `perf` 采样器，不许另写一份；改参数/字段要同步 `docs/agent.md`。
+- MCP 只暴露 `qawork_doctor` / `qawork_devices` / `qawork_perf` / `qawork_report` / `qawork_validate_plan` / `qawork_run_plan` / `qawork_compat_matrix`，不提供任意 shell/adb 透传。
+- MCP 工具与 CLI 共用 `perf` 采样器、`automation.Execute`、`compat.Run`，不许另写一份；改参数/字段要同步 `docs/agent.md`。
 - Agent 的验证顺序：**Android 真机/模拟器优先**；PC 进程只验证 CPU/内存，不能拿它当帧率证据。
 - 新增/修改工具参数必须补 `internal/mcp` 单测，协议测试不许起真实 adb。
 
@@ -48,15 +51,16 @@ GUI 和 CLI 必须共用同一份采样与 CSV 口径，否则"窗口里看到�
 
 - `internal/setup` 是唯一实现，GUI 环境页和 `qawork setup` 共用；不许在 UI 层复制下载/解压逻辑。
 - **adb 必装**，scrcpy 可选，Android USB 驱动标记 `manual`；驱动不许给假安装按钮。
-- 安装只写当前用户目录（`%APPDATA%\QAWork\tools`，`QAWORK_HOME` 可覆盖）和 HKCU 用户 PATH，**不需要管理员**，不写系统目录/系统 PATH。
-- 测试不得修改真实注册表或真实用户 PATH；解压必须保留 `..` 越界防护。
+- 安装只写当前用户目录（Windows `%APPDATA%\QAWork\tools`、macOS `~/Library/Application Support/QAWork/tools`，`QAWORK_HOME` 可覆盖）；Windows 写 HKCU 用户 PATH，macOS 写 `~/.zprofile` 的受管块。**不需要管理员**，不写系统目录/系统 PATH。
+- macOS 免厂商 USB 驱动；Windows 的 Android USB 驱动仍标 `manual`，不给假安装按钮。
+- 测试不得修改真实注册表或真实用户 PATH；解压必须保留 `..` 越界防护；macOS 解压后要补 `chmod +x`。
 - 环境依赖变化要同步 `docs/setup.md`，并把"必装"原因写清楚。
 
 ## 测试
 
 - 提交前 `go test -count=1 ./...` 必须全绿；CI 同命令。
-- 解析器、CSV、门禁、MCP 协议、setup 解压/PATH 拼接属纯逻辑，**必须有单测**。
-- 真机采样、SurfaceFlinger 层、Unity/UE 线程属硬件路径，单测不覆盖时必须在文档标"需真机验收"，不许假装测过。
+- 解析器、CSV、门禁、MCP 协议、setup 解压/PATH 拼接属纯逻辑，**必须有单测**；`automation` 的计划解析/校验/Launch 解析/StepCommand/runner（fake device + fake sampler）、`compat` 的 WM size/logcat/CSV 也必须有单测。
+- 真机采样、SurfaceFlinger 层、Unity/UE 线程、真实多设备矩阵属硬件路径，单测不覆盖时必须在文档标"需真机验收"，不许假装测过。
 - 覆盖率用 `go test -cover ./...` 记录，不追求数字；硬件路径低覆盖要在 PR 里说明原因。
 
 ## 维护
@@ -66,9 +70,9 @@ GUI 和 CLI 必须共用同一份采样与 CSV 口径，否则"窗口里看到�
 
 ## 数据诚实原则
 
-- 没接的数据不许编。兼容性、自动化面板写"规划中"，不摆假报表、假设备。
-- 采集不到帧率的目标（PC 进程）标记为"无帧率来源"，门禁跳过帧率检查，并在 UI/CLI 明确写出来。
-- 新增指标必须在 `docs/perfdog-mode.md` 写清来源、单位、已知边界。
+- 没接的数据不许编。兼容矩阵只写在设备上真实跑出来的行；失败、crash、ANR 必须带 logcat/截图证据。
+- 采集不到帧率的目标（PC 进程）标记为"无帧率来源"，门禁跳过帧率检查，并在 UI/CLI 明确写出来。macOS 本机进程用 `ps` 取 CPU/RSS，没有 FPS。
+- 新增指标必须在 `docs/perfdog-mode.md` 写清来源、单位、已知边界；自动化/兼容口径写在 `docs/automation.md`。
 - 引擎识别与线程口径以 `docs/engines.md` 为准：Unity 认 `UnityMain`/`UnityGfxDeviceW`，UE5 认 `GameThread`/`RenderThread`/`RHIThread`，未命中写 `native`，不许猜引擎。引擎名匹配必须保留"只对 ≥8 字符名字做前后缀容错"，否则 `main` 会误配 `UnityMain`。
 
 ## 在 Windows 上必须做的验证
@@ -83,8 +87,18 @@ go build -o qawork.exe .\cmd\qawork
 go build -o qawork-gui.exe .\cmd\qawork-gui
 .\qawork.exe version
 .\qawork.exe setup check -json
+.\qawork.exe run -plan examples\qawork.yaml -validate
+.\qawork.exe run -plan examples\qawork.yaml -serial <serial> -artifacts automation-smoke
+.\qawork.exe compat -package <pkg> -devices <serial> -artifacts compat-smoke
 .\qawork-gui.exe -demo -capture .\docs\shot.png   # 首帧自检，人工看一眼
 .\qawork-gui.exe -setup -capture .\docs\setup.png # 环境页自检
+```
+
+macOS 另跑（真机或 CI 必须至少做交叉编译与单测）：
+
+```bash
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./cmd/qawork ./cmd/qawork-gui
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go test -c ./internal/perf ./internal/setup
 ```
 
 MCP 协议冒烟（不需要设备）：
@@ -99,11 +113,11 @@ MCP 协议冒烟（不需要设备）：
 .\qawork.exe perf -serial <serial> -package <pkg> -duration 8s -csv smoke.csv
 ```
 
-改完 UI 必须重新生成 `docs/shot.png`，README 用它当门面；环境页改动同时重生成 `docs/setup.png`。
+改完 UI 必须重新生成 `docs/shot.png`，README 用它当门面；环境页改动同时重生成 `docs/setup.png`。自动化/兼容只写真实跑出来的结果，不贴假矩阵。
 
 ## 发布
 
-打 tag `vX.Y.Z` 触发 `.github/workflows/ci.yml`，上传 Windows 产物并建 Release。
+打 tag `vX.Y.Z` 触发 `.github/workflows/ci.yml`，双平台构建并上传 Windows amd64 + macOS arm64 产物，建 Release。
 版本号同时改 `internal/version/version.go` 和 `mygo.json`。
 
 ## 提交信息

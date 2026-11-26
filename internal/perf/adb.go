@@ -1,6 +1,7 @@
 package perf
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os/exec"
@@ -32,6 +33,22 @@ func (a ADB) Exec(ctx context.Context, args ...string) (string, error) {
 		return string(out), fmt.Errorf("adb %s: %w: %s", strings.Join(args, " "), err, msg)
 	}
 	return string(out), nil
+}
+
+// ExecBytes runs an adb command and returns raw stdout, for screenshots.
+func (a ADB) ExecBytes(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, a.bin(), args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			return nil, fmt.Errorf("adb %s: %w", strings.Join(args, " "), err)
+		}
+		return nil, fmt.Errorf("adb %s: %w: %s", strings.Join(args, " "), err, msg)
+	}
+	return out, nil
 }
 
 // Shell runs a shell command on one device.

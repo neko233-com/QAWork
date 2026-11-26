@@ -3,8 +3,9 @@
 //
 // The default mode is PerfDog-style performance capture: pick a device and
 // an app, record frame rate, CPU, memory and temperature at a fixed interval,
-// then gate the run against thresholds. Compatibility and automation are
-// declared modes with honest "not wired yet" panels, not hidden mock data.
+// then gate the run against thresholds. Compatibility batches and
+// qawork.yaml automation both run real adb work; panels show only what
+// actually came back.
 package app
 
 import (
@@ -13,12 +14,15 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
 	"github.com/egoist/mygo/ui"
 	"github.com/lobehub/lobe-mygo/pkg/theme"
 
+	"github.com/neko233-com/QAWork/internal/automation"
+	"github.com/neko233-com/QAWork/internal/compat"
 	"github.com/neko233-com/QAWork/internal/perf"
 	"github.com/neko233-com/QAWork/internal/setup"
 	"github.com/neko233-com/QAWork/internal/version"
@@ -37,10 +41,9 @@ const (
 	tableSamples   = 40
 )
 
-// The workbench declares three modes. Only PerfDog performance capture is
-// wired; compatibility and automation are labelled as planned, never
-// filled with mock data. The default stays PerfDog, and the numbering is
-// part of the app's public shape.
+// The workbench declares three modes. PerfDog performance capture is the
+// default; compatibility and automation are real adb workflows now, each
+// with its own panel. The numbering is part of the app's public shape.
 const (
 	ModePerfDog = iota
 	ModeCompat
@@ -82,20 +85,39 @@ type App struct {
 	setupDir     string
 	setupMsg     string
 	setupRunning bool
+
+	// Automation panel.
+	automationPlanPath string
+	automationCase     string
+	automationMsg      string
+	automationRunning  bool
+	automationResults  []automation.Result
+	automationTable    ui.ListState
+
+	// Compatibility panel.
+	compatPlanPath string
+	compatPackage  string
+	compatAPK      string
+	compatCase     string
+	compatMsg      string
+	compatRunning  bool
+	compatMatrix   compat.Matrix
+	compatTable    ui.ListState
 }
 
 // New returns the workbench in its default mode: PerfDog-style performance
 // capture at one sample per second against a 60 fps target.
 func New(host Host) *App {
 	return &App{
-		ADB:           perf.ADB{},
-		Mode:          ModePerfDog,
-		Interval:      1,
-		IntervalLabel: "1 s",
-		NominalFPS:    60,
-		Thresholds:    perf.DefaultThresholds(),
-		Host:          host,
-		status:        "就绪：默认 PerfDog 性能模式",
+		ADB:                perf.ADB{},
+		Mode:               ModePerfDog,
+		Interval:           1,
+		IntervalLabel:      "1 s",
+		NominalFPS:         60,
+		Thresholds:         perf.DefaultThresholds(),
+		Host:               host,
+		automationPlanPath: "qawork.yaml",
+		status:             "就绪：默认 PerfDog 性能模式",
 	}
 }
 
@@ -257,6 +279,251 @@ func (a *App) InstallRequired() {
 	}
 }
 
+// ValidatePlan checks qawork.yaml without touching a device.
+func (a *App) ValidatePlan() {
+	path := a.automationPlanPath
+	plan, err := automation.LoadPlan(path)
+	if err != nil {
+		a.mu.Lock()
+		a.automationMsg = "读取失败：" + err.Error()
+		a.mu.Unlock()
+		if a.Host != nil {
+			a.Host.Update(func() {})
+		}
+		return
+	}
+	errs := plan.Validate()
+	msg := fmt.Sprintf("计划有效：%d 个 case", len(plan.Cases))
+	if len(errs) > 0 {
+		msg = "计划有 " + fmt.Sprint(len(errs)) + " 处问题："
+		for _, e := range errs {
+			msg += "\n· " + e.Error()
+		}
+	}
+	a.mu.Lock()
+	a.automationMsg = msg
+	a.mu.Unlock()
+	if a.Host != nil {
+		a.Host.Update(func() {})
+	}
+}
+
+// RunPlan loads qawork.yaml and runs the selected cases on the selected
+// Android device (or the first online one) in the background.
+func (a *App) RunPlan() {
+	a.mu.Lock()
+	if a.automationRunning {
+		a.mu.Unlock()
+		return
+	}
+	if a.running {
+		a.mu.Unlock()
+		a.setAutomationMsg("先停止性能采集")
+		return
+	}
+	path := a.automationPlanPath
+	caseName := a.automationCase
+	serial := a.Serial
+	if serial == "local" {
+		a.mu.Unlock()
+		a.setAutomationMsg("自动化只支持 Android；PC 进程没有 adb 回放")
+		return
+	}
+	a.automationRunning = true
+	a.automationResults = nil
+	a.automationMsg = "加载计划…"
+	a.mu.Unlock()
+
+	plan, err := automation.LoadPlan(path)
+	if err != nil {
+		a.finishAutomation("读取计划失败：" + err.Error())
+		return
+	}
+	if errs := plan.Validate(); len(errs) > 0 {
+		a.finishAutomation("计划校验失败：" + errs[0].Error())
+		return
+	}
+	indices, err := automation.SelectIndices(plan, caseName)
+	if err != nil {
+		a.finishAutomation(err.Error())
+		return
+	}
+	root := filepath.Join(DataDir(), "automation", time.Now().Format("20060102-150405"))
+	host := a.Host
+	go func() {
+		results := automation.Execute(context.Background(), automation.ExecuteOptions{
+			ADB: a.ADB, Plan: plan, Indices: indices, Serial: serial,
+			ArtifactsRoot: root, Timeout: 10 * time.Minute,
+			OnStart: func(_ int, cs automation.Case) {
+				a.setAutomationMsg("运行 " + cs.Name + "…")
+			},
+		})
+		a.mu.Lock()
+		a.automationRunning = false
+		a.automationResults = results
+		failed := 0
+		for _, r := range results {
+			if r.Failed {
+				failed++
+			}
+		}
+		if failed == 0 {
+			a.automationMsg = fmt.Sprintf("完成：%d 个 case 全部通过", len(results))
+		} else {
+			a.automationMsg = fmt.Sprintf("完成：%d 个 case，%d 个失败", len(results), failed)
+		}
+		a.mu.Unlock()
+		if host != nil {
+			host.Update(func() {})
+		}
+	}()
+}
+
+func (a *App) setAutomationMsg(msg string) {
+	a.mu.Lock()
+	a.automationMsg = msg
+	a.mu.Unlock()
+	if a.Host != nil {
+		a.Host.Update(func() {})
+	}
+}
+
+// AutomationState copies the panel state for drawing; background runs write
+// these fields, so the view must not read them directly.
+func (a *App) AutomationState() (results []automation.Result, msg string, running bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	results = append([]automation.Result(nil), a.automationResults...)
+	return results, a.automationMsg, a.automationRunning
+}
+
+// AutomationNotice is the footer line for automation mode.
+func (a *App) AutomationNotice() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.automationMsg != "" {
+		return a.automationMsg
+	}
+	return "自动化：qawork.yaml 驱动 adb，产物落本地"
+}
+
+func (a *App) finishAutomation(msg string) {
+	a.mu.Lock()
+	a.automationRunning = false
+	a.automationMsg = msg
+	a.mu.Unlock()
+	if a.Host != nil {
+		a.Host.Update(func() {})
+	}
+}
+
+// RunCompat runs every online Android device through the same case set.
+func (a *App) RunCompat() {
+	a.mu.Lock()
+	if a.compatRunning {
+		a.mu.Unlock()
+		return
+	}
+	if a.running {
+		a.mu.Unlock()
+		a.setCompatMsg("先停止性能采集")
+		return
+	}
+	planPath := a.compatPlanPath
+	pkg := a.compatPackage
+	apk := a.compatAPK
+	caseName := a.compatCase
+	a.compatRunning = true
+	a.compatMatrix = compat.Matrix{}
+	a.compatMsg = "准备兼容矩阵…"
+	a.mu.Unlock()
+
+	var plan *automation.Plan
+	if planPath != "" {
+		p, err := automation.LoadPlan(planPath)
+		if err != nil {
+			a.finishCompat("读取计划失败：" + err.Error())
+			return
+		}
+		if errs := p.Validate(); len(errs) > 0 {
+			a.finishCompat("计划校验失败：" + errs[0].Error())
+			return
+		}
+		plan = p
+	}
+	if plan == nil && pkg == "" {
+		a.finishCompat("没有计划时必须填包名")
+		return
+	}
+	root := filepath.Join(DataDir(), "compat", time.Now().Format("20060102-150405"))
+	host := a.Host
+	go func() {
+		m, err := compat.Run(context.Background(), compat.Options{
+			ADB: a.ADB, Plan: plan, Package: pkg, CaseName: caseName, APKPath: apk,
+			ArtifactsRoot: root, Timeout: 10 * time.Minute,
+			OnDevice: func(serial string, done, total int) {
+				a.setCompatMsg(fmt.Sprintf("[%d/%d] %s …", done, total, serial))
+			},
+		})
+		a.mu.Lock()
+		a.compatRunning = false
+		if err != nil {
+			a.compatMsg = "兼容矩阵失败：" + err.Error()
+		} else {
+			a.compatMatrix = m
+			failed := 0
+			for _, r := range m.Rows {
+				if r.Failed {
+					failed++
+				}
+			}
+			a.compatMsg = fmt.Sprintf("完成：%d 台 × %d 个用例，%d 行失败", m.Devices, m.Cases, failed)
+		}
+		a.mu.Unlock()
+		if host != nil {
+			host.Update(func() {})
+		}
+	}()
+}
+
+func (a *App) setCompatMsg(msg string) {
+	a.mu.Lock()
+	a.compatMsg = msg
+	a.mu.Unlock()
+	if a.Host != nil {
+		a.Host.Update(func() {})
+	}
+}
+
+// CompatState copies the panel state for drawing.
+func (a *App) CompatState() (matrix compat.Matrix, msg string, running bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	matrix = a.compatMatrix
+	matrix.Rows = append([]compat.Row(nil), a.compatMatrix.Rows...)
+	return matrix, a.compatMsg, a.compatRunning
+}
+
+// CompatNotice is the footer line for compatibility mode.
+func (a *App) CompatNotice() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.compatMsg != "" {
+		return a.compatMsg
+	}
+	return "兼容性：所有在线设备批量跑，失败行带 logcat/截图"
+}
+
+func (a *App) finishCompat(msg string) {
+	a.mu.Lock()
+	a.compatRunning = false
+	a.compatMsg = msg
+	a.mu.Unlock()
+	if a.Host != nil {
+		a.Host.Update(func() {})
+	}
+}
+
 // Devices returns the last device list.
 func (a *App) Devices() ([]perf.Device, string) {
 	a.mu.Lock()
@@ -270,6 +537,11 @@ func (a *App) Devices() ([]perf.Device, string) {
 func (a *App) Start() {
 	a.mu.Lock()
 	if a.running {
+		a.mu.Unlock()
+		return
+	}
+	if a.automationRunning || a.compatRunning {
+		a.lastErr = "自动化/兼容矩阵跑完再采性能"
 		a.mu.Unlock()
 		return
 	}
@@ -495,39 +767,47 @@ func (a *App) sidebar(c *ui.Context, tk *theme.Tokens) {
 		})
 
 		ui.Divider(c)
-		ui.Text(c, "目标包名 / 进程名").FontSize(12).TextColor(tk.TextSecondary)
-		ui.TextInput(c, &a.Target).Placeholder("com.example.game 或 Game.exe")
+		if a.Mode == ModePerfDog {
+			ui.Text(c, "目标包名 / 进程名").FontSize(12).TextColor(tk.TextSecondary)
+			ui.TextInput(c, &a.Target).Placeholder("com.example.game 或 Game.exe")
 
-		if last, ok := a.Latest(); ok {
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "引擎").FontSize(11).TextColor(tk.TextTertiary)
-				if last.Engine == "" {
-					ui.Badge(c, "未识别")
-				} else {
-					ui.Badge(c, last.Engine.Label())
+			if last, ok := a.Latest(); ok {
+				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "引擎").FontSize(11).TextColor(tk.TextTertiary)
+					if last.Engine == "" {
+						ui.Badge(c, "未识别")
+					} else {
+						ui.Badge(c, last.Engine.Label())
+					}
+				})
+				if last.MainThread != "" {
+					ui.Text(c, fmt.Sprintf("%s %.0f%% · %s %.0f%%", last.MainThread, last.MainCPU, last.RenderThread, last.RenderCPU)).
+						FontSize(11).TextColor(tk.TextSecondary).Wrap()
 				}
-			})
-			if last.MainThread != "" {
-				ui.Text(c, fmt.Sprintf("%s %.0f%% · %s %.0f%%", last.MainThread, last.MainCPU, last.RenderThread, last.RenderCPU)).
-					FontSize(11).TextColor(tk.TextSecondary).Wrap()
 			}
-		}
 
-		ui.Text(c, "采样间隔").FontSize(12).TextColor(tk.TextSecondary)
-		ui.Select(c, &a.IntervalLabel, []string{"500 ms", "1 s", "2 s"})
+			ui.Text(c, "采样间隔").FontSize(12).TextColor(tk.TextSecondary)
+			ui.Select(c, &a.IntervalLabel, []string{"500 ms", "1 s", "2 s"})
 
-		if a.IsRunning() {
-			if ui.PrimaryButton(c, "停止采集").FillWidth().Clicked() {
-				a.Stop()
+			if a.IsRunning() {
+				if ui.PrimaryButton(c, "停止采集").FillWidth().Clicked() {
+					a.Stop()
+				}
+			} else {
+				if ui.PrimaryButton(c, "开始采集").FillWidth().Clicked() {
+					a.Start()
+				}
 			}
+
+			ui.Divider(c)
+			a.thresholdLine(c, tk)
+		} else if a.Mode == ModeAutomation {
+			ui.Text(c, "自动化使用计划里的包名与步骤。这里选中的 Android 设备会覆盖计划 serial；选“本机进程”无效。").
+				FontSize(11).TextColor(tk.TextTertiary).Wrap()
 		} else {
-			if ui.PrimaryButton(c, "开始采集").FillWidth().Clicked() {
-				a.Start()
-			}
+			ui.Text(c, "兼容矩阵默认跑所有在线 Android 设备；侧栏选择不限制批量范围。").
+				FontSize(11).TextColor(tk.TextTertiary).Wrap()
 		}
-
-		ui.Divider(c)
-		a.thresholdLine(c, tk)
 	})
 }
 
@@ -721,7 +1001,11 @@ func (a *App) setupPanel(c *ui.Context, tk *theme.Tokens) {
 			go a.RefreshSetup(context.Background())
 		}
 	})
-	ui.Text(c, "只装你需要的。adb 必装；scrcpy 可选；USB 驱动由厂商提供，QAWork 不代装。").
+	usbText := "USB 驱动由厂商提供，QAWork 不代装。"
+	if runtime.GOOS == "darwin" {
+		usbText = "macOS USB 免驱，不需要厂商驱动。"
+	}
+	ui.Text(c, "只装你需要的。adb 必装；scrcpy 可选；"+usbText).
 		FontSize(12).TextColor(tk.TextSecondary).Wrap()
 	if dir != "" {
 		ui.Text(c, "安装目录： "+dir+"（只写当前用户 PATH，不需要管理员权限）").
@@ -789,50 +1073,311 @@ func (a *App) setupRow(c *ui.Context, tk *theme.Tokens, d setup.Dep, running boo
 }
 
 func (a *App) compatPanel(c *ui.Context, tk *theme.Tokens) {
+	matrix, msg, running := a.CompatState()
 	ui.Column(c).Gap(10).Children(func() {
 		ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
 			ui.Text(c, "兼容性矩阵").FontSize(16).Bold().TextColor(tk.Text)
-			ui.Badge(c, "规划中")
+			ui.Badge(c, "可用")
 		})
-		ui.Text(c, "PerfDog 只做性能；兼容性在 QAWork 里是另一条线：本地设备农场，不上传安装包。").
+		ui.Text(c, "所有在线 Android 设备 × 用例：批量安装 APK、冷启动、短采样、抓 crash/ANR，结果落本地 CSV/JSON。").
 			FontSize(12).TextColor(tk.TextSecondary).Wrap()
-		for _, item := range []string{
-			"多机型批量安装、冷启动、首帧耗时",
-			"分辨率 / 系统版本 / ABI 矩阵，结果本地落盘",
-			"崩溃与 ANR 率统计，同一 CSV 口径进 CI",
-			"预留云真机通道：租云设备或自建设备池，二选一",
-		} {
-			ui.Text(c, "· "+item).FontSize(12).TextColor(tk.TextSecondary).Wrap()
+
+		ui.Row(c).Gap(8).AlignItems(ui.End).Children(func() {
+			ui.Column(c).Grow(1).Basis(0).Gap(3).Children(func() {
+				ui.Text(c, "计划（可选）").FontSize(11).TextColor(tk.TextTertiary)
+				ui.TextInput(c, &a.compatPlanPath).Placeholder("qawork.yaml；留空只做启动 smoke")
+			})
+			ui.Column(c).Grow(1).Basis(0).Gap(3).Children(func() {
+				ui.Text(c, "包名（无计划时必填）").FontSize(11).TextColor(tk.TextTertiary)
+				ui.TextInput(c, &a.compatPackage).Placeholder("com.example.game")
+			})
+		})
+		ui.Row(c).Gap(8).AlignItems(ui.End).Children(func() {
+			ui.Column(c).Grow(1).Basis(0).Gap(3).Children(func() {
+				ui.Text(c, "APK（可选，先批量安装）").FontSize(11).TextColor(tk.TextTertiary)
+				ui.TextInput(c, &a.compatAPK).Placeholder("build/app.apk")
+			})
+			ui.Column(c).Width(160).Gap(3).Children(func() {
+				ui.Text(c, "只跑指定 case").FontSize(11).TextColor(tk.TextTertiary)
+				ui.TextInput(c, &a.compatCase).Placeholder("留空跑全部")
+			})
+			if running {
+				ui.Badge(c, "运行中")
+			} else if ui.PrimaryButton(c, "运行兼容矩阵").Clicked() {
+				a.RunCompat()
+			}
+		})
+		if msg != "" {
+			ui.Text(c, msg).FontSize(11).TextColor(tk.TextSecondary).Wrap()
 		}
-		ui.Divider(c)
-		ui.Text(c, "先把 PerfDog 模式的口径做准，再接矩阵——否则兼容性报告没有可比性。").
-			FontSize(12).TextColor(tk.TextTertiary).Wrap()
+
+		if len(matrix.Rows) == 0 {
+			ui.Divider(c)
+			for _, item := range []string{
+				"多机型批量安装、冷启动、首帧耗时",
+				"型号 / Android / SDK / ABI / 分辨率矩阵",
+				"崩溃与 ANR 按包名扫描，避免别的 App 污染结果",
+				"矩阵 CSV/JSON 与每设备截图、logcat 一起落盘",
+			} {
+				ui.Text(c, "· "+item).FontSize(12).TextColor(tk.TextSecondary).Wrap()
+			}
+			return
+		}
+
+		ui.Text(c, fmt.Sprintf("%d 台设备 × %d 个用例，%.1fs%s", matrix.Devices, matrix.Cases, matrix.DurationSeconds, passText(matrix.Failed))).
+			FontSize(12).TextColor(tk.TextSecondary).Wrap()
+		ui.Scroll(c).Grow(1).Basis(0).MinHeight(0).Children(func() {
+			a.compatResultTable(c, tk, matrix.Rows)
+		})
+		if matrix.CSV != "" {
+			ui.Text(c, "矩阵 CSV："+matrix.CSV).FontSize(11).TextColor(tk.TextTertiary).NoWrap()
+		}
+		if matrix.JSON != "" {
+			ui.Text(c, "矩阵 JSON："+matrix.JSON).FontSize(11).TextColor(tk.TextTertiary).NoWrap()
+		}
+	})
+}
+
+func (a *App) compatResultTable(c *ui.Context, tk *theme.Tokens, rows []compat.Row) {
+	columns := []ui.TableColumn{
+		{Title: "设备", Width: 130, Fixed: true},
+		{Title: "型号", Width: 110},
+		{Title: "Android", Width: 70},
+		{Title: "用例", Width: 110},
+		{Title: "安装", Width: 54},
+		{Title: "启动", Width: 70},
+		{Title: "FPS", Width: 54},
+		{Title: "Crash", Width: 54},
+		{Title: "ANR", Width: 46},
+		{Title: "结果", Width: 70},
+	}
+	ui.Table(c, &a.compatTable, columns, len(rows), func(row, col int) {
+		if row < 0 || row >= len(rows) {
+			return
+		}
+		r := rows[row]
+		var text string
+		switch col {
+		case 0:
+			text = r.Serial
+		case 1:
+			text = r.Model
+		case 2:
+			text = r.Android
+		case 3:
+			text = r.Case
+		case 4:
+			if r.InstallSkipped {
+				text = "跳过"
+			} else {
+				text = yesNo(r.Installed)
+			}
+		case 5:
+			text = msText(r.StartupMS)
+		case 6:
+			text = fpsText(r.FPSMean)
+		case 7:
+			text = yesNo(r.Crash)
+		case 8:
+			text = yesNo(r.ANR)
+		case 9:
+			if r.Failed {
+				text = "失败"
+			} else {
+				text = "通过"
+			}
+		}
+		color := tk.Text
+		if r.Failed {
+			color = tk.Error
+		}
+		ui.Text(c, text).FontSize(12).TextColor(color).NoWrap()
 	})
 }
 
 func (a *App) automationPanel(c *ui.Context, tk *theme.Tokens) {
+	results, msg, running := a.AutomationState()
 	ui.Column(c).Gap(10).Children(func() {
 		ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
 			ui.Text(c, "自动化用例").FontSize(16).Bold().TextColor(tk.Text)
-			ui.Badge(c, "规划中")
+			ui.Badge(c, "可用")
 		})
-		ui.Text(c, "用例写进 qawork.yaml，由 adb 回放，跑完直接盖性能门禁。").
+		ui.Text(c, "qawork.yaml 驱动 adb：launch / tap / swipe / wait / keyevent / text / screenshot，全程采样并盖性能门禁。").
 			FontSize(12).TextColor(tk.TextSecondary).Wrap()
-		ui.Text(c, "yaml 目标形态：").FontSize(12).TextColor(tk.TextTertiary)
-		for _, line := range []string{
-			"case: 登录到主界面",
-			"steps: [launch, tap 540 1600, wait 8s, swipe 540 1600 540 600]",
-			"perf: {interval: 1s, min_fps: 48, max_jank: 5}",
-		} {
-			ui.Text(c, "  "+line).FontSize(12).TextColor(tk.TextSecondary).NoWrap()
+
+		ui.Row(c).Gap(8).AlignItems(ui.End).Children(func() {
+			ui.Column(c).Grow(1).Basis(0).Gap(3).Children(func() {
+				ui.Text(c, "计划文件").FontSize(11).TextColor(tk.TextTertiary)
+				ui.TextInput(c, &a.automationPlanPath).Placeholder("qawork.yaml")
+			})
+			ui.Column(c).Width(180).Gap(3).Children(func() {
+				ui.Text(c, "只跑指定 case").FontSize(11).TextColor(tk.TextTertiary)
+				ui.TextInput(c, &a.automationCase).Placeholder("留空跑全部")
+			})
+			if ui.Button(c, "校验").Clicked() && !running {
+				a.ValidatePlan()
+			}
+			if running {
+				ui.Badge(c, "运行中")
+			} else if ui.PrimaryButton(c, "运行计划").Clicked() {
+				a.RunPlan()
+			}
+		})
+		if msg != "" {
+			ui.Text(c, msg).FontSize(11).TextColor(tk.TextSecondary).Wrap()
+		}
+
+		if len(results) == 0 {
+			ui.Divider(c)
+			ui.Text(c, "示例：").
+				FontSize(12).TextColor(tk.TextTertiary)
+			for _, line := range []string{
+				"cases:",
+				"  - name: 登录到主界面",
+				"    package: com.example.game",
+				"    steps:",
+				"      - {action: launch, cold: true}",
+				"      - {action: tap, x: 540, y: 1600}",
+				"      - {action: wait, seconds: 8}",
+			} {
+				ui.Text(c, "  "+line).FontSize(12).TextColor(tk.TextSecondary).NoWrap()
+			}
+			return
+		}
+		ui.Scroll(c).Grow(1).Basis(0).MinHeight(0).Children(func() {
+			a.automationResultTable(c, tk, results)
+		})
+		if dir := automationArtifactsDir(results); dir != "" {
+			ui.Text(c, "产物："+dir).FontSize(11).TextColor(tk.TextTertiary).NoWrap()
 		}
 	})
+}
+
+func (a *App) automationResultTable(c *ui.Context, tk *theme.Tokens, results []automation.Result) {
+	columns := []ui.TableColumn{
+		{Title: "用例", Width: 150, Fixed: true},
+		{Title: "包名", Width: 180},
+		{Title: "结果", Width: 70},
+		{Title: "FPS", Width: 60},
+		{Title: "启动", Width: 80},
+		{Title: "失败检查", Width: 90},
+		{Title: "说明", Width: 220},
+	}
+	ui.Table(c, &a.automationTable, columns, len(results), func(row, col int) {
+		if row < 0 || row >= len(results) {
+			return
+		}
+		r := results[row]
+		var text string
+		switch col {
+		case 0:
+			text = r.Case
+		case 1:
+			text = r.Package
+		case 2:
+			if r.Failed {
+				text = "失败"
+			} else {
+				text = "通过"
+			}
+		case 3:
+			text = fmt.Sprintf("%.1f", r.Summary.FPSMean)
+		case 4:
+			text = msText(r.StartupMS)
+		case 5:
+			text = fmt.Sprintf("%d", failedCheckCount(r.Checks))
+		case 6:
+			if r.Error != "" {
+				text = r.Error
+			} else {
+				text = failedCheckNames(r.Checks)
+			}
+		}
+		color := tk.Text
+		if r.Failed {
+			color = tk.Error
+		}
+		ui.Text(c, text).FontSize(12).TextColor(color).NoWrap()
+	})
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "是"
+	}
+	return "否"
+}
+
+func msText(v float64) string {
+	if v <= 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.0fms", v)
+}
+
+func fpsText(v float64) string {
+	if v <= 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.1f", v)
+}
+
+func passText(failed bool) string {
+	if failed {
+		return "，有失败"
+	}
+	return "，全部通过"
+}
+
+func failedCheckCount(checks []perf.Check) int {
+	n := 0
+	for _, c := range checks {
+		if !c.OK {
+			n++
+		}
+	}
+	return n
+}
+
+func failedCheckNames(checks []perf.Check) string {
+	var out []string
+	for _, c := range checks {
+		if !c.OK {
+			out = append(out, c.Name)
+		}
+	}
+	if len(out) == 0 {
+		return "—"
+	}
+	s := out[0]
+	for _, n := range out[1:] {
+		s += "、" + n
+	}
+	return s
+}
+
+func automationArtifactsDir(results []automation.Result) string {
+	for _, r := range results {
+		for _, p := range r.Artifacts {
+			if st, err := os.Stat(p); err == nil {
+				if st.IsDir() {
+					return p
+				}
+				return filepath.Dir(p)
+			}
+		}
+	}
+	return ""
 }
 
 func (a *App) footer(c *ui.Context, tk *theme.Tokens) {
 	status := a.Status()
 	if a.ShowSetup {
 		status = "环境安装：只写当前用户目录与 PATH，不需要管理员权限"
+	} else if a.Mode == ModeAutomation {
+		status = a.AutomationNotice()
+	} else if a.Mode == ModeCompat {
+		status = a.CompatNotice()
 	}
 	ui.Row(c).Padding(8, 16).Gap(12).AlignItems(ui.Center).Background(tk.BgContainer).Children(func() {
 		ui.Text(c, status).FontSize(11).TextColor(tk.TextSecondary).NoWrap()

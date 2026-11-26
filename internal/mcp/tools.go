@@ -3,8 +3,12 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/neko233-com/QAWork/internal/automation"
+	"github.com/neko233-com/QAWork/internal/compat"
 	"github.com/neko233-com/QAWork/internal/perf"
 	"github.com/neko233-com/QAWork/internal/setup"
 )
@@ -62,6 +66,53 @@ func defaultTools() []Tool {
 				"properties": map[string]any{},
 			},
 			Run: toolDoctor,
+		},
+		{
+			Name:        "qawork_validate_plan",
+			Description: "校验 qawork.yaml 自动化计划：case 名、步骤、阈值、时长。不碰设备，改完计划先跑这个。",
+			Schema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"plan": map[string]any{"type": "string", "description": "qawork.yaml 路径"},
+				},
+				"required": []string{"plan"},
+			},
+			Run: toolValidatePlan,
+		},
+		{
+			Name: "qawork_run_plan",
+			Description: "按 qawork.yaml 自动跑 Android 用例：launch/tap/swipe/wait 步骤 + 全程性能采样 + 门禁。" +
+				"返回每个 case 的摘要、步骤、检查与产物路径（CSV/JSON/失败截图）。",
+			Schema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"plan":            map[string]any{"type": "string", "description": "qawork.yaml 路径"},
+					"case":            map[string]any{"type": "string", "description": "只跑指定 case；留空跑全部"},
+					"serial":          map[string]any{"type": "string", "description": "覆盖计划里的设备序列号"},
+					"artifacts":       map[string]any{"type": "string", "description": "产物根目录，留空用 QAWORK_HOME/automation"},
+					"timeout_seconds": map[string]any{"type": "number", "description": "单个 case 超时，默认 600，上限 1800"},
+				},
+				"required": []string{"plan"},
+			},
+			Run: toolRunPlan,
+		},
+		{
+			Name: "qawork_compat_matrix",
+			Description: "批量兼容测试：所有在线设备（或指定 devices）× 用例，安装 APK、冷启动、短采样、抓 crash/ANR，" +
+				"输出矩阵 CSV/JSON。没有 plan 时只做启动 smoke。",
+			Schema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"plan":            map[string]any{"type": "string", "description": "可选 qawork.yaml"},
+					"case":            map[string]any{"type": "string", "description": "只跑指定 case"},
+					"package":         map[string]any{"type": "string", "description": "无 plan 时的包名"},
+					"apk":             map[string]any{"type": "string", "description": "可选 APK 路径，先批量安装"},
+					"devices":         map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "设备序列号；留空全部在线"},
+					"artifacts":       map[string]any{"type": "string", "description": "产物根目录"},
+					"timeout_seconds": map[string]any{"type": "number", "description": "单个 case 超时，默认 600，上限 1800"},
+				},
+			},
+			Run: toolCompatMatrix,
 		},
 	}
 }
@@ -205,6 +256,129 @@ func nextStep(deps []setup.Dep) string {
 		}
 	}
 	return "环境就绪：qawork_devices 选设备，再 qawork_perf"
+}
+
+func toolValidatePlan(ctx context.Context, args map[string]any) (any, error) {
+	path := argString(args, "plan")
+	if path == "" {
+		return nil, fmt.Errorf("缺少 plan")
+	}
+	plan, err := automation.LoadPlan(path)
+	if err != nil {
+		if verr, ok := err.(*automation.ValidationError); ok {
+			return map[string]any{"valid": false, "errors": errorStrings(verr.Errors)}, nil
+		}
+		return nil, err
+	}
+	return map[string]any{
+		"valid": true, "version": plan.Version, "cases": plan.Names(), "path": path,
+	}, nil
+}
+
+func toolRunPlan(ctx context.Context, args map[string]any) (any, error) {
+	path := argString(args, "plan")
+	if path == "" {
+		return nil, fmt.Errorf("缺少 plan")
+	}
+	plan, err := automation.LoadPlan(path)
+	if err != nil {
+		return nil, err
+	}
+	indices, err := automation.SelectIndices(plan, argString(args, "case"))
+	if err != nil {
+		return nil, err
+	}
+	timeout := argFloat(args, "timeout_seconds", 600)
+	if timeout <= 0 {
+		timeout = 600
+	}
+	if timeout > 1800 {
+		timeout = 1800
+	}
+	root := argString(args, "artifacts")
+	if root == "" {
+		root = filepath.Join(setup.HomeDir(), "automation", time.Now().Format("20060102-150405"))
+	}
+	adb := perf.ADB{Path: setup.ADBPath()}
+	results := automation.Execute(ctx, automation.ExecuteOptions{
+		ADB: adb, Plan: plan, Indices: indices, Serial: argString(args, "serial"),
+		ArtifactsRoot: root, Timeout: time.Duration(timeout) * time.Second,
+	})
+	anyFail := false
+	for _, r := range results {
+		if r.Failed {
+			anyFail = true
+		}
+	}
+	return map[string]any{
+		"plan": path, "results": results, "failed": anyFail, "artifacts": root,
+	}, nil
+}
+
+func errorStrings(errs []error) []string {
+	out := make([]string, 0, len(errs))
+	for _, err := range errs {
+		out = append(out, err.Error())
+	}
+	return out
+}
+
+func toolCompatMatrix(ctx context.Context, args map[string]any) (any, error) {
+	var plan *automation.Plan
+	if path := argString(args, "plan"); path != "" {
+		p, err := automation.LoadPlan(path)
+		if err != nil {
+			return nil, err
+		}
+		plan = p
+	}
+	timeout := argFloat(args, "timeout_seconds", 600)
+	if timeout <= 0 {
+		timeout = 600
+	}
+	if timeout > 1800 {
+		timeout = 1800
+	}
+	root := argString(args, "artifacts")
+	if root == "" {
+		root = filepath.Join(setup.HomeDir(), "compat", time.Now().Format("20060102-150405"))
+	}
+	matrix, err := compat.Run(ctx, compat.Options{
+		ADB: perf.ADB{Path: setup.ADBPath()}, Plan: plan, CaseName: argString(args, "case"),
+		Package: argString(args, "package"), APKPath: argString(args, "apk"),
+		Devices: argStringSlice(args, "devices"), ArtifactsRoot: root,
+		Timeout: time.Duration(timeout) * time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return matrix, nil
+}
+
+func argStringSlice(args map[string]any, key string) []string {
+	raw, ok := args[key]
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
+	case string:
+		var out []string
+		for _, s := range strings.Split(v, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 func firstSerial(ctx context.Context) string {

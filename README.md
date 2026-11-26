@@ -12,7 +12,7 @@
 | 维度 | PerfDog（腾讯 WeTest 产品） | QAWork（本地工作台） |
 | --- | --- | --- |
 | 形态 | 桌面客户端 + 账号体系，云同步报告 | 开源原生窗口 + CLI，离线可用 |
-| 平台 | Android / iOS 等多端，覆盖成熟 | Android + Windows 本机进程（CPU/内存），iOS 未接 |
+| 平台 | Android / iOS 等多端，覆盖成熟 | Android + Windows/macOS 本机进程（CPU/内存），iOS 未接 |
 | 数据 | 平台报告为主 | CSV/JSON 落本地，直接进 CI |
 | 自动化 | 客户端内报告与分析 | 退出码 2 的门禁，任意 CI 直接卡 |
 | 二开 | 闭源 | 纯 Go，改采样器、接自有设备池 |
@@ -22,15 +22,19 @@
 
 ## 工作模式
 
-当前声明三种，只有第一种是可用状态，另外两种是明确标注的规划，不摆假数据：
+当前三种模式都已接真实 adb 流程，不摆假数据：
 
 | # | 模式 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | 0 | **PerfDog 性能**（默认） | 可用 | 对标 [PerfDog](https://wetest.qq.com/products/perfdog) 的采集口径 |
-| 1 | 兼容性 | 规划中 | 本地设备农场跑安装/冷启/崩溃矩阵，不属于 PerfDog 的能力范围 |
-| 2 | 自动化 | 规划中 | `qawork.yaml` 用例 + adb 回放 + 性能门禁 |
+| 1 | 兼容性 | 可用 | 所有在线设备 × 用例：批量安装/冷启/崩溃矩阵，不属于 PerfDog 的能力范围 |
+| 2 | 自动化 | 可用 | `qawork.yaml` 用例 + adb 回放 + 性能门禁 |
 
 模式编号与默认值写死在 `internal/app`（`Mode` 默认 0），文档、UI、CLI 三处必须一致。
+
+## 宿主平台
+
+只支持两个宿主：**Windows x86（amd64）** 与 **macOS arm64**；当前开发机是 Windows 时只做 Windows 真实验证，macOS 由 CI 与真机补。Android 侧统一走 adb，不区分宿主。
 
 ## 快速开始
 
@@ -58,17 +62,32 @@ qawork setup install -id adb                     # 必装；已装则跳过
 qawork perf -serial 127.0.0.1:16384 -package com.example.game -duration 60s -csv run.csv
 qawork perf -serial local -package Game.exe -duration 30s          # 本机进程（无帧率）
 qawork report -csv run.csv -min-fps 50 -max-jank 5                 # 只汇总和判定
+qawork run -plan qawork.yaml                     # 自动化：步骤回放 + 采样 + 门禁
+qawork run -plan qawork.yaml -validate           # 只校验计划，不碰设备
+qawork compat -plan qawork.yaml -apk app.apk     # 批量兼容：所有在线设备 × 用例
 qawork mcp                                                         # stdio MCP，给 Agent
 ```
 
-`perf` 和 `report` 在门禁不通过时退出码 2，可直接当 CI 卡点。`-json` 输出机器可读结果。
+`perf` / `run` / `compat` / `report` 在门禁或兼容失败时退出码 2，可直接当 CI 卡点。`-json` 输出机器可读结果。
+
+### 自动化与兼容
+
+`examples/qawork.yaml` 是可直接校验的示例。步骤只支持 `launch`（仅第一步）/ `wait` / `tap` / `swipe` / `keyevent` / `text`（仅 ASCII）/ `screenshot`；全程按 `interval` 采样，结束后按阈值盖门禁，失败自动留 `failure.png`。
+
+兼容矩阵对每台在线设备：可选装 APK → 清 logcat → 跑同一 case → 扫 `FATAL EXCEPTION` / `ANR in <包名>` → 截屏；输出设备信息、启动耗时、FPS/CPU/内存、crash/ANR 与通过列到 `compat-matrix.csv/json`。没有计划时只做启动 smoke，不做性能判定。
+
+口径、产物结构和已知边界见 [docs/automation.md](docs/automation.md)。
+
+![自动化用例](docs/automation.png)
+
+![兼容矩阵](docs/compat.png)
 
 ## Agent 原生：CLI / MCP
 
 QAWork 从设计上就是给 Agent 用的，不只是给人点的窗口：
 
-- **CLI**：`devices` / `perf` / `report` / `setup` 全部支持 `-json`，门禁失败退出码 2，Agent 可以直接判断。
-- **MCP**：`qawork.exe mcp` 起 stdio JSON-RPC，暴露 `qawork_doctor`、`qawork_devices`、`qawork_perf`、`qawork_report` 四个工具。采样器、CSV 与 GUI 完全同源。
+- **CLI**：`devices` / `perf` / `report` / `setup` / `run` / `compat` 全部支持 `-json`，门禁/兼容失败退出码 2，Agent 可以直接判断。
+- **MCP**：`qawork.exe mcp` 起 stdio JSON-RPC，暴露 `qawork_doctor`、`qawork_devices`、`qawork_perf`、`qawork_report`、`qawork_validate_plan`、`qawork_run_plan`、`qawork_compat_matrix` 七个工具。采样器、CSV 与 GUI 完全同源。
 
 ```json
 {
@@ -78,7 +97,7 @@ QAWork 从设计上就是给 Agent 用的，不只是给人点的窗口：
 }
 ```
 
-典型 Agent 流程：`qawork_doctor` 修环境 → `qawork_devices` 拿序列号 → `qawork_perf` 采 10–30s → 看 `summary.engine` 的主/渲线程 → `qawork_report` 换阈值复判。**Android 是首选验证平台**；PC 进程只采 CPU/内存，没有帧率来源。
+典型 Agent 流程：`qawork_doctor` 修环境 → `qawork_devices` 拿序列号 → `qawork_validate_plan` 校验 yaml → `qawork_run_plan` 跑自动化 → `qawork_compat_matrix` 批量过机型 → `qawork_report` 换阈值复判。**Android 是首选验证平台**；PC 进程只采 CPU/内存，没有帧率来源。
 
 完整协议、参数、JSON 字段和边界见 [docs/agent.md](docs/agent.md)。
 
@@ -88,23 +107,23 @@ QAWork 从设计上就是给 Agent 用的，不只是给人点的窗口：
 
 | 依赖 | 级别 | 说明 |
 | --- | --- | --- |
-| **adb（Platform Tools）** | **必装** | 没有它 Android 采样完全不可用；从 Google 官方下载，装进 `%APPDATA%\QAWork\tools`，写当前用户 PATH |
+| **adb（Platform Tools）** | **必装** | 没有它 Android 采样完全不可用；从 Google 官方下载，装进 `%APPDATA%\QAWork\tools`（macOS 为 `~/Library/Application Support/QAWork/tools`），写当前用户 PATH |
 | scrcpy | 可选 | 投屏/录屏/点按调试，不影响采样口径 |
-| Android USB 驱动 | 手动 | 厂商驱动，QAWork 不代装、不改驱动配置 |
+| Android USB 驱动 | 平台相关 | Windows 厂商驱动需手动装；macOS 免驱 |
 
-无需管理员权限，不写系统目录。CLI 同样可用：`qawork setup check -json`、`qawork setup install -id adb`。细节、卸载和边界见 [docs/setup.md](docs/setup.md)。
+无需管理员权限，不写系统目录。Windows 写 HKCU 用户 PATH；macOS 写 `~/.zprofile` 的受管块。CLI 同样可用：`qawork setup check -json`、`qawork setup install -id adb`。细节、卸载和边界见 [docs/setup.md](docs/setup.md)。
 
 ![环境安装](docs/setup.png)
 
 ## 采集口径
 
-| 指标 | Android | 本机进程（Windows） |
+| 指标 | Android | 本机进程（Windows / macOS） |
 | --- | --- | --- |
 | FPS | `dumpsys SurfaceFlinger --latency` 取应用层的实际上屏时间戳；取不到时退到 `gfxinfo` 帧数增量 | 无（需要 Present hook，规划中） |
 | 帧耗时 | 1000/FPS，汇总时算 P50/P95/P99 | 无 |
 | 卡顿帧 | `gfxinfo` 的 Janky frames 增量占比 | 无 |
-| CPU | `/proc/<pid>/stat` 的 utime+stime 增量（100 Hz jiffies） | `GetProcessTimes` 内核+用户时间增量 |
-| 内存 | `/proc/<pid>/stat` 的 rss 页数 × 4 KiB | PSAPI working set |
+| CPU | `/proc/<pid>/stat` 的 utime+stime 增量（100 Hz jiffies） | Windows `GetProcessTimes`；macOS `ps -o time` 累计 CPU 时间增量 |
+| 内存 | `/proc/<pid>/stat` 的 rss 页数 × 4 KiB | Windows PSAPI working set；macOS `ps -o rss` |
 | 温度 | `dumpsys battery` 的电池温度 | 无 |
 
 细节与已知边界见 [docs/perfdog-mode.md](docs/perfdog-mode.md)。
@@ -137,8 +156,8 @@ if ($LASTEXITCODE -eq 2) { throw "性能门禁未通过" }
 
 ## 现在能做什么，不能做什么
 
-能：真机/模拟器上采一个应用的真实帧率、CPU、内存、温度；本机进程采 CPU/内存；CSV 与 JSON；门禁退出码。
-不能：PC 游戏帧率（要注入 Present/ETW，未做）；SoC 温度（只有电池温度）；兼容性与自动化（只有面板和路线图，没有假数据）。
+能：真机/模拟器上采一个应用的真实帧率、CPU、内存、温度；Windows/macOS 本机进程采 CPU/内存；`qawork.yaml` 自动化回放 + 门禁；多设备批量兼容矩阵（安装、启动、crash/ANR、截图、CSV/JSON）。
+不能：PC 游戏帧率（要注入 Present/ETW，未做）；SoC 温度（只有电池温度）；iOS；云真机调度。
 
 完整路线见 [docs/roadmap.md](docs/roadmap.md)。
 

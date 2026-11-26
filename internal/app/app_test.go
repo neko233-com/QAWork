@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/neko233-com/QAWork/internal/automation"
+	"github.com/neko233-com/QAWork/internal/compat"
 	"github.com/neko233-com/QAWork/internal/perf"
 	"github.com/neko233-com/QAWork/internal/setup"
 )
@@ -25,6 +27,115 @@ func TestNewDefaults(t *testing.T) {
 	}
 	if a.Thresholds != perf.DefaultThresholds() {
 		t.Errorf("thresholds = %+v", a.Thresholds)
+	}
+	if a.automationPlanPath != "qawork.yaml" {
+		t.Errorf("plan path = %q", a.automationPlanPath)
+	}
+}
+
+func TestAutomationStartGuards(t *testing.T) {
+	a := New(nil)
+	a.Target = "com.example.game"
+	a.Serial = "s"
+	a.mu.Lock()
+	a.automationRunning = true
+	a.mu.Unlock()
+	a.Start()
+	if !strings.Contains(a.Status(), "自动化") {
+		t.Errorf("status = %q", a.Status())
+	}
+	if a.IsRunning() {
+		t.Error("perf capture must not start while automation runs")
+	}
+}
+
+func TestValidatePlanPanel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "qawork.yaml")
+	if err := os.WriteFile(path, []byte("version: 1\ncases:\n  - name: a\n    package: com.a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := New(nil)
+	a.automationPlanPath = path
+	a.ValidatePlan()
+	if !strings.Contains(a.automationMsg, "计划有效") {
+		t.Errorf("msg = %q", a.automationMsg)
+	}
+
+	a.automationPlanPath = filepath.Join(dir, "missing.yaml")
+	a.ValidatePlan()
+	if !strings.Contains(a.automationMsg, "读取失败") {
+		t.Errorf("msg = %q", a.automationMsg)
+	}
+}
+
+func TestRunPlanRejectsLocalTarget(t *testing.T) {
+	a := New(nil)
+	a.Serial = "local"
+	a.RunPlan()
+	if a.automationRunning {
+		t.Error("must not start")
+	}
+	if !strings.Contains(a.automationMsg, "只支持 Android") {
+		t.Errorf("msg = %q", a.automationMsg)
+	}
+}
+
+func TestRunCompatRequiresPackageWithoutPlan(t *testing.T) {
+	a := New(nil)
+	a.compatPlanPath = ""
+	a.compatPackage = ""
+	a.RunCompat()
+	if a.compatRunning {
+		t.Error("must not start")
+	}
+	if !strings.Contains(a.compatMsg, "包名") {
+		t.Errorf("msg = %q", a.compatMsg)
+	}
+}
+
+func TestPanelStateCopies(t *testing.T) {
+	a := New(nil)
+	a.mu.Lock()
+	a.automationResults = []automation.Result{{Case: "a"}}
+	a.automationMsg = ""
+	a.compatMatrix = compat.Matrix{Rows: []compat.Row{{DeviceInfo: compat.DeviceInfo{Serial: "s"}}}}
+	a.mu.Unlock()
+
+	results, _, running := a.AutomationState()
+	if len(results) != 1 || running {
+		t.Fatalf("automation = %+v", results)
+	}
+	results[0].Case = "mutated"
+	if got, _, _ := a.AutomationState(); got[0].Case != "a" {
+		t.Error("automation results must be copied")
+	}
+	if got := a.AutomationNotice(); !strings.Contains(got, "qawork.yaml") {
+		t.Errorf("notice = %q", got)
+	}
+
+	m, _, _ := a.CompatState()
+	if len(m.Rows) != 1 {
+		t.Fatalf("compat = %+v", m)
+	}
+	m.Rows[0].Serial = "mutated"
+	if got, _, _ := a.CompatState(); got.Rows[0].Serial != "s" {
+		t.Error("compat rows must be copied")
+	}
+	if got := a.CompatNotice(); !strings.Contains(got, "在线设备") {
+		t.Errorf("notice = %q", got)
+	}
+}
+
+func TestCompatFormatHelpers(t *testing.T) {
+	if yesNo(true) != "是" || yesNo(false) != "否" {
+		t.Error("yesNo")
+	}
+	if msText(0) != "—" || msText(123.4) != "123ms" {
+		t.Errorf("msText = %q %q", msText(0), msText(123.4))
+	}
+	if fpsText(0) != "—" || fpsText(30.5) != "30.5" {
+		t.Errorf("fpsText = %q %q", fpsText(0), fpsText(30.5))
 	}
 }
 
@@ -179,6 +290,9 @@ func TestRefreshSetupAdoptsADB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(adbDir, "adb.exe"), []byte("stub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(adbDir, "adb"), []byte("stub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", "")

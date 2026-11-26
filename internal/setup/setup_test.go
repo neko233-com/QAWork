@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -46,9 +47,35 @@ func TestADBPathFromEnv(t *testing.T) {
 	t.Setenv("QAWORK_ADB", filepath.Join(t.TempDir(), "missing.exe"))
 	t.Setenv("QAWORK_HOME", filepath.Join(t.TempDir(), "home2"))
 	t.Setenv("LOCALAPPDATA", t.TempDir())
+	t.Setenv("ANDROID_HOME", "")
+	t.Setenv("ANDROID_SDK_ROOT", "")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
 	t.Setenv("PATH", "")
 	if got := ADBPath(); got != "" {
 		t.Errorf("ADBPath = %q, want empty", got)
+	}
+}
+
+func TestADBPathFromAndroidHome(t *testing.T) {
+	sdk := t.TempDir()
+	dir := filepath.Join(sdk, "platform-tools")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := filepath.Join(dir, exe("adb"))
+	if err := os.WriteFile(fake, []byte("stub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("QAWORK_ADB", "")
+	t.Setenv("QAWORK_HOME", filepath.Join(t.TempDir(), "home"))
+	t.Setenv("LOCALAPPDATA", "")
+	t.Setenv("PATH", "")
+	t.Setenv("ANDROID_HOME", "")
+	t.Setenv("ANDROID_SDK_ROOT", sdk)
+	t.Setenv("HOME", t.TempDir())
+	if got := ADBPath(); got != fake {
+		t.Errorf("ADBPath = %q, want %q", got, fake)
 	}
 }
 
@@ -76,8 +103,14 @@ func TestInspectBundledADB(t *testing.T) {
 		t.Error("scrcpy row missing")
 	}
 	driver, ok := FindDep(report, "usb-driver")
-	if !ok || driver.Status != StatusManual || driver.Installable {
+	if !ok || driver.Installable {
 		t.Errorf("driver = %+v", driver)
+	}
+	if runtime.GOOS == "windows" && driver.Status != StatusManual {
+		t.Errorf("windows driver = %+v", driver)
+	}
+	if runtime.GOOS == "darwin" && driver.Status != StatusOK {
+		t.Errorf("mac driver = %+v", driver)
 	}
 	if report.Summary == "" {
 		t.Error("summary empty")
@@ -175,13 +208,39 @@ func TestPickScrcpyAsset(t *testing.T) {
 		{Name: "scrcpy-win64-v3.3.1.zip", URL: "https://example.com/win64.zip"},
 		{Name: "scrcpy-linux.zip", URL: "https://example.com/linux.zip"},
 	}
-	url, tag, err := pickScrcpyAsset(r)
+	url, tag, err := pickScrcpyAssetFor(r, "windows", "amd64")
 	if err != nil || url != "https://example.com/win64.zip" || tag != "v3.3.1" {
 		t.Errorf("asset = %q %q %v", url, tag, err)
 	}
-	r.Assets = nil
-	if _, _, err := pickScrcpyAsset(r); err == nil {
-		t.Error("want error without win64 asset")
+	if _, _, err := pickScrcpyAssetFor(r, "darwin", "arm64"); err == nil {
+		t.Error("want error without macos asset")
+	}
+}
+
+func TestPickScrcpyAssetDarwin(t *testing.T) {
+	r := release{TagName: "v5.0.1", Assets: []asset{
+		{Name: "scrcpy-win64-v5.0.1.zip", URL: "https://example.com/win.zip"},
+		{Name: "scrcpy-macos-aarch64-v5.0.1.zip", URL: "https://example.com/mac-arm.zip"},
+		{Name: "scrcpy-macos-x86_64-v5.0.1.zip", URL: "https://example.com/mac-intel.zip"},
+	}}
+	url, _, err := pickScrcpyAssetFor(r, "darwin", "arm64")
+	if err != nil || url != "https://example.com/mac-arm.zip" {
+		t.Errorf("asset = %q %v", url, err)
+	}
+	// A universal macos zip is the fallback when no arm64 build exists.
+	r.Assets = []asset{{Name: "scrcpy-macos-v5.0.1.zip", URL: "https://example.com/mac.zip"}}
+	url, _, err = pickScrcpyAssetFor(r, "darwin", "arm64")
+	if err != nil || url != "https://example.com/mac.zip" {
+		t.Errorf("fallback = %q %v", url, err)
+	}
+}
+
+func TestPlatformToolsURLFor(t *testing.T) {
+	if got := platformToolsURLFor("windows"); !strings.Contains(got, "windows") {
+		t.Errorf("windows = %q", got)
+	}
+	if got := platformToolsURLFor("darwin"); !strings.Contains(got, "darwin") {
+		t.Errorf("darwin = %q", got)
 	}
 }
 

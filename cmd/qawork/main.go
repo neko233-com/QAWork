@@ -32,6 +32,10 @@ func main() {
 		os.Exit(cmdPerf(os.Args[2:]))
 	case "report":
 		os.Exit(cmdReport(os.Args[2:]))
+	case "run":
+		os.Exit(cmdRun(os.Args[2:]))
+	case "compat":
+		os.Exit(cmdCompat(os.Args[2:]))
 	case "setup":
 		os.Exit(cmdSetup(os.Args[2:]))
 	case "mcp":
@@ -52,6 +56,8 @@ func usage() {
   qawork devices [-adb PATH] [-json]        列出 adb 设备
   qawork perf -package PKG [-serial S] ...  采集一次并写 CSV，失败退出码 2
   qawork report -csv FILE                   汇总 CSV 并按阈值判定
+  qawork run -plan qawork.yaml              跑自动化用例（校验/门禁/产物）
+  qawork compat [-plan qawork.yaml]         批量兼容：所有在线设备 × 用例矩阵
   qawork setup [check|install] [-id adb]    检查/安装 adb、scrcpy（只写用户 PATH）
   qawork mcp                                stdio MCP 服务，给 agent 直接调
 

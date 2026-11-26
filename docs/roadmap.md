@@ -14,32 +14,32 @@
 
 - Unity / UE5 引擎识别（线程名），主线程与渲染线程 CPU 进 CSV/UI/CLI
 - SurfaceFlinger 时间戳增量算 FPS，gfxinfo 兜底，静态界面不再把上一轮帧率当现在
-- Agent 接口：CLI `-json`、`qawork mcp`（stdio MCP，四个工具）
+- Agent 接口：CLI `-json`、`qawork mcp`（stdio MCP）
 - 环境安装独立 UI + `qawork setup`：adb 必装、scrcpy 可选、驱动手动，只写用户目录与 PATH
 - 单测覆盖解析器、CSV 兼容、门禁、MCP 协议、setup 解压/PATH
 
-## v0.3（下一步）
+## v0.3（已落地）
+
+- `qawork.yaml` 自动化：launch / tap / swipe / wait / keyevent / text / screenshot，全程采样 + 门禁 + CSV/JSON/失败截图
+- `qawork run` CLI + MCP `qawork_validate_plan` / `qawork_run_plan`；GUI 自动化面板
+- 批量兼容矩阵：多设备安装 APK、设备信息、冷启、短采样、logcat crash/ANR、截图、矩阵 CSV/JSON
+- `qawork compat` CLI + MCP `qawork_compat_matrix`；GUI 兼容面板
+- 宿主收敛：Windows amd64 + macOS arm64；macOS 本机进程 `ps` 采样、platform-tools/scrcpy 下载、`~/.zprofile` PATH
+- 测试：automation 计划/步骤/launch/runner（fake device+sampler）、compat logcat/WM size/CSV、MCP 七工具、双平台测试编译
+- 已真实跑通：Windows + Android 15 模拟器上的 Settings 自动化与兼容 smoke
+
+## v0.4（下一步）
 
 - Unity / UE 包的真机验收（当前只有线程名单测，没有可测包）
+- 兼容矩阵扩展：native tombstone、低内存杀进程、长稳 logcat 流；设备并行（当前串行）
 - 长时采集的掉帧归因（卡顿帧 × 时间轴对齐）
 - 报告页：单次报告可导出 Markdown（含曲线图），进 PR 附件
-- 阈值可从 `qawork.yaml` 读，CLI 与 GUI 共用
-
-验收：`qawork perf -duration 120s` 在两台不同 Android 设备上给出可复现 CSV；Unity/UE 包的引擎与线程字段人工核对通过。
-
-## v0.4
-
-- 兼容性矩阵：多设备并发安装/冷启/首帧耗时，结果本地 SQLite
-- 崩溃与 ANR 统计（`logcat` 结构化），矩阵视图
-
-验收：3 台设备并行跑同一 APK，输出一张矩阵表 + 失败用例的 logcat 片段。
-
-## v0.5
-
-- `qawork.yaml` 用例 + adb 回放 + 性能门禁，跑完生成 CI 产物
 - GitHub Actions 模板，开箱即用
+
+验收：`qawork compat -plan qawork.yaml -apk app.apk` 在 ≥3 台真机上给出矩阵，含至少一次真实 crash/ANR 的可复现证据；Unity/UE 包的引擎与线程字段人工核对通过。
 
 ## 暂不做
 
 - Present hook / ETW 的 PC 游戏帧率采集（工程量大，先不画饼）
 - 云真机出租、账号体系、云端协作（那是 WeTest 的主场，不是 QAWork 的方向）
+- iOS、Linux 宿主

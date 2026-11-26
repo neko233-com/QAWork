@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !darwin
 
 package setup
 
@@ -7,9 +7,9 @@ import (
 	"os"
 )
 
-// AddUserPath is only wired on Windows, QAWork's release target.
+// AddUserPath is only wired on Windows and macOS, QAWork's release targets.
 func AddUserPath(dirs ...string) error {
-	return errors.New("环境安装目前只支持 Windows")
+	return errors.New("环境安装目前只支持 Windows 与 macOS")
 }
 
 // UserPathHas reports whether dir is already on PATH.

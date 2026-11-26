@@ -38,7 +38,7 @@ QAWork 的默认模式。名字里的 PerfDog 指腾讯 WeTest 旗下的性能�
 - **SurfaceFlinger 是 127 帧的环形缓冲**：1 秒间隔最多数到 127 帧，所以 `fps` 上限按 240 截顶；测 120/144 fps 建议 `-interval 500ms`，否则会被缓冲长度压低。
 - **温度不是 SoC**：只有电池温度，热节流要看 `thermalservice`，未接入。
 - **CPU 是单核口径**：要看整机占用得再乘/除核数，报告里保持单核便于横向比较。
-- **PC 进程没有帧率**：Windows 上不注入 Present hook 就拿不到帧率，硬编一个“60 fps”就是造假；当前明确标记“无帧率来源”。
+- **PC 进程没有帧率**：Windows/macOS 上不注入 Present hook 就拿不到帧率，硬编一个“60 fps”就是造假；当前明确标记“无帧率来源”。
 - **jiffies 假设 100 Hz**：Android 常见 100 Hz，个别内核不同；未做探测，写在这里免得出错没人知道。
 - **引擎靠线程名**：识别依据是 Unity/UE 自身的线程命名，改线程名的自定义引擎会落到 `native`；UE5.8 不解析 `stat`、不探测版本，细节见 [engines.md](engines.md)。
 

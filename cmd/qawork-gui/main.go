@@ -33,6 +33,7 @@ func main() {
 	demoSerial := flag.String("demo-serial", "local", "自检设备序列号，local 为本机进程")
 	demoPackage := flag.String("demo-package", "qawork-gui.exe", "自检目标包名或进程名")
 	setupOnly := flag.Bool("setup", false, "直接打开环境安装界面")
+	modeFlag := flag.String("mode", "perf", "截图/启动时的工作模式：perf、compat、automation")
 	flag.Parse()
 
 	h := &host{}
@@ -49,6 +50,12 @@ func main() {
 		})
 		h.win = win
 		a.ShowSetup = *setupOnly
+		switch *modeFlag {
+		case "compat", "1":
+			a.Mode = app.ModeCompat
+		case "automation", "2":
+			a.Mode = app.ModeAutomation
+		}
 		go a.RefreshSetup(context.Background())
 		go a.RefreshDevices(context.Background())
 
