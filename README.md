@@ -53,12 +53,48 @@ go build -o qawork.exe .\cmd\qawork           # CLI
 
 ```powershell
 qawork devices                                   # 列 adb 设备
+qawork setup check                               # 检查 adb / scrcpy / 驱动
+qawork setup install -id adb                     # 必装；已装则跳过
 qawork perf -serial 127.0.0.1:16384 -package com.example.game -duration 60s -csv run.csv
 qawork perf -serial local -package Game.exe -duration 30s          # 本机进程（无帧率）
 qawork report -csv run.csv -min-fps 50 -max-jank 5                 # 只汇总和判定
+qawork mcp                                                         # stdio MCP，给 Agent
 ```
 
 `perf` 和 `report` 在门禁不通过时退出码 2，可直接当 CI 卡点。`-json` 输出机器可读结果。
+
+## Agent 原生：CLI / MCP
+
+QAWork 从设计上就是给 Agent 用的，不只是给人点的窗口：
+
+- **CLI**：`devices` / `perf` / `report` / `setup` 全部支持 `-json`，门禁失败退出码 2，Agent 可以直接判断。
+- **MCP**：`qawork.exe mcp` 起 stdio JSON-RPC，暴露 `qawork_doctor`、`qawork_devices`、`qawork_perf`、`qawork_report` 四个工具。采样器、CSV 与 GUI 完全同源。
+
+```json
+{
+  "mcpServers": {
+    "qawork": { "command": "D:\\Tools\\qawork.exe", "args": ["mcp"] }
+  }
+}
+```
+
+典型 Agent 流程：`qawork_doctor` 修环境 → `qawork_devices` 拿序列号 → `qawork_perf` 采 10–30s → 看 `summary.engine` 的主/渲线程 → `qawork_report` 换阈值复判。**Android 是首选验证平台**；PC 进程只采 CPU/内存，没有帧率来源。
+
+完整协议、参数、JSON 字段和边界见 [docs/agent.md](docs/agent.md)。
+
+## 环境安装（独立 UI）
+
+主界面右上角 **环境**，或 `qawork-gui.exe -setup`，打开独立的环境安装界面：每个依赖单独一行、单独安装，不搞全家桶。
+
+| 依赖 | 级别 | 说明 |
+| --- | --- | --- |
+| **adb（Platform Tools）** | **必装** | 没有它 Android 采样完全不可用；从 Google 官方下载，装进 `%APPDATA%\QAWork\tools`，写当前用户 PATH |
+| scrcpy | 可选 | 投屏/录屏/点按调试，不影响采样口径 |
+| Android USB 驱动 | 手动 | 厂商驱动，QAWork 不代装、不改驱动配置 |
+
+无需管理员权限，不写系统目录。CLI 同样可用：`qawork setup check -json`、`qawork setup install -id adb`。细节、卸载和边界见 [docs/setup.md](docs/setup.md)。
+
+![环境安装](docs/setup.png)
 
 ## 采集口径
 

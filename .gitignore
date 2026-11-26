@@ -8,6 +8,8 @@
 
 # local captures and smoke data
 /smoke*.csv
+/*-smoke.csv
+/mcp-*.json
 /sessions/
 
 # OS junk

@@ -32,6 +32,7 @@ func main() {
 	demo := flag.Bool("demo", false, "自检：自动采一段再截图")
 	demoSerial := flag.String("demo-serial", "local", "自检设备序列号，local 为本机进程")
 	demoPackage := flag.String("demo-package", "qawork-gui.exe", "自检目标包名或进程名")
+	setupOnly := flag.Bool("setup", false, "直接打开环境安装界面")
 	flag.Parse()
 
 	h := &host{}
@@ -47,9 +48,11 @@ func main() {
 			Content:   ui.View(a.View),
 		})
 		h.win = win
+		a.ShowSetup = *setupOnly
+		go a.RefreshSetup(context.Background())
 		go a.RefreshDevices(context.Background())
 
-		if *demo {
+		if *demo && !*setupOnly {
 			a.Serial = *demoSerial
 			a.Target = *demoPackage
 			go func() {
@@ -60,7 +63,7 @@ func main() {
 
 		if *capture != "" {
 			wait := 1800 * time.Millisecond
-			if *demo {
+			if *demo && !*setupOnly {
 				wait = 9 * time.Second
 			}
 			go func() {

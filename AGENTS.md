@@ -35,6 +35,35 @@ QAWork 的工程规则。改代码前先读这一页。
 
 GUI 和 CLI 必须共用同一份采样与 CSV 口径，否则"窗口里看到的"和"CI 判的"会打架。
 
+## Agent 接口（CLI / MCP）
+
+- CLI 的 `devices` / `perf` / `report` / `setup` 都必须支持 `-json`，门禁失败退出码 2，环境缺必装项退出码 2。
+- `internal/mcp` 是唯一的 MCP 实现，stdio JSON-RPC 2.0；**stdout 只准写协议帧**，日志/进度一律 stderr。
+- MCP 只暴露 `qawork_doctor` / `qawork_devices` / `qawork_perf` / `qawork_report`，不提供任意 shell/adb 透传。
+- MCP 工具与 CLI 共用 `perf` 采样器，不许另写一份；改参数/字段要同步 `docs/agent.md`。
+- Agent 的验证顺序：**Android 真机/模拟器优先**；PC 进程只验证 CPU/内存，不能拿它当帧率证据。
+- 新增/修改工具参数必须补 `internal/mcp` 单测，协议测试不许起真实 adb。
+
+## 环境安装工具
+
+- `internal/setup` 是唯一实现，GUI 环境页和 `qawork setup` 共用；不许在 UI 层复制下载/解压逻辑。
+- **adb 必装**，scrcpy 可选，Android USB 驱动标记 `manual`；驱动不许给假安装按钮。
+- 安装只写当前用户目录（`%APPDATA%\QAWork\tools`，`QAWORK_HOME` 可覆盖）和 HKCU 用户 PATH，**不需要管理员**，不写系统目录/系统 PATH。
+- 测试不得修改真实注册表或真实用户 PATH；解压必须保留 `..` 越界防护。
+- 环境依赖变化要同步 `docs/setup.md`，并把"必装"原因写清楚。
+
+## 测试
+
+- 提交前 `go test -count=1 ./...` 必须全绿；CI 同命令。
+- 解析器、CSV、门禁、MCP 协议、setup 解压/PATH 拼接属纯逻辑，**必须有单测**。
+- 真机采样、SurfaceFlinger 层、Unity/UE 线程属硬件路径，单测不覆盖时必须在文档标"需真机验收"，不许假装测过。
+- 覆盖率用 `go test -cover ./...` 记录，不追求数字；硬件路径低覆盖要在 PR 里说明原因。
+
+## 维护
+
+- 日常维护者：**@akai183**（2026-11 起接手；写权限已开）。仓库 owner 仍是 [neko233-com](https://github.com/neko233-com)。
+- 接手范围：日常 PR/issue、引擎与 Android 口径、CI 绿线；发版 tag 与仓库设置由 owner 把关。
+
 ## 数据诚实原则
 
 - 没接的数据不许编。兼容性、自动化面板写"规划中"，不摆假报表、假设备。
@@ -49,10 +78,19 @@ $env:CGO_ENABLED = "0"
 gofmt -w .
 go vet ./...
 go test -count=1 ./...
+go test -cover ./...
 go build -o qawork.exe .\cmd\qawork
 go build -o qawork-gui.exe .\cmd\qawork-gui
 .\qawork.exe version
+.\qawork.exe setup check -json
 .\qawork-gui.exe -demo -capture .\docs\shot.png   # 首帧自检，人工看一眼
+.\qawork-gui.exe -setup -capture .\docs\setup.png # 环境页自检
+```
+
+MCP 协议冒烟（不需要设备）：
+
+```powershell
+'{"jsonrpc":"2.0","id":1,"method":"initialize"}' | .\qawork.exe mcp
 ```
 
 有设备时补一条真实采集（只读操作）：
@@ -61,7 +99,7 @@ go build -o qawork-gui.exe .\cmd\qawork-gui
 .\qawork.exe perf -serial <serial> -package <pkg> -duration 8s -csv smoke.csv
 ```
 
-改完 UI 必须重新生成 `docs/shot.png`，README 用它当门面。
+改完 UI 必须重新生成 `docs/shot.png`，README 用它当门面；环境页改动同时重生成 `docs/setup.png`。
 
 ## 发布
 

@@ -5,4 +5,4 @@ package version
 const Product = "QAWork"
 
 // Version is the current release version, bumped by the release workflow.
-var Version = "0.1.0"
+var Version = "0.2.0"

@@ -20,6 +20,7 @@ import (
 	"github.com/lobehub/lobe-mygo/pkg/theme"
 
 	"github.com/neko233-com/QAWork/internal/perf"
+	"github.com/neko233-com/QAWork/internal/setup"
 	"github.com/neko233-com/QAWork/internal/version"
 )
 
@@ -55,6 +56,10 @@ type App struct {
 	Interval      int
 	IntervalLabel string
 
+	// ShowSetup opens the environment installer instead of the workbench.
+	// It is a separate screen, not a fourth work mode.
+	ShowSetup bool
+
 	NominalFPS float64
 	Thresholds perf.Thresholds
 
@@ -72,6 +77,11 @@ type App struct {
 	devices   []perf.Device
 	deviceErr string
 	table     ui.ListState
+
+	setupDeps    []setup.Dep
+	setupDir     string
+	setupMsg     string
+	setupRunning bool
 }
 
 // New returns the workbench in its default mode: PerfDog-style performance
@@ -164,6 +174,86 @@ func (a *App) RefreshDevices(ctx context.Context) {
 	a.mu.Unlock()
 	if a.Host != nil {
 		a.Host.Update(func() {})
+	}
+}
+
+// SetupState is what the environment screen draws.
+func (a *App) SetupState() (deps []setup.Dep, dir, msg string, running bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	deps = append(deps, a.setupDeps...)
+	return deps, a.setupDir, a.setupMsg, a.setupRunning
+}
+
+// RefreshSetup probes adb, scrcpy and the manual USB driver, and adopts the
+// adb QAWork finds so the GUI and CLI use the same binary.
+func (a *App) RefreshSetup(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	report := setup.Inspect(ctx)
+	a.mu.Lock()
+	a.setupDeps = report.Deps
+	a.setupDir = report.ToolsDir
+	if report.ADBPath != "" && a.ADB.Path == "" {
+		a.ADB.Path = report.ADBPath
+	}
+	a.mu.Unlock()
+	if a.Host != nil {
+		a.Host.Update(func() {})
+	}
+}
+
+// InstallDep installs adb or scrcpy in the background: download to the
+// tools dir, then append that dir to the current user's PATH. The USB
+// driver stays manual on purpose.
+func (a *App) InstallDep(id string) {
+	a.mu.Lock()
+	if a.setupRunning {
+		a.mu.Unlock()
+		return
+	}
+	a.setupRunning = true
+	a.setupMsg = "准备安装 " + id + "…"
+	a.mu.Unlock()
+
+	host := a.Host
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		_, err := setup.Install(ctx, id, true, func(msg string) {
+			a.mu.Lock()
+			a.setupMsg = msg
+			a.mu.Unlock()
+			if host != nil {
+				host.Update(func() {})
+			}
+		})
+		a.mu.Lock()
+		a.setupRunning = false
+		if err != nil {
+			a.setupMsg = "安装失败：" + err.Error()
+		} else {
+			a.setupMsg = "安装完成：" + id
+		}
+		a.mu.Unlock()
+		if host != nil {
+			host.Update(func() {})
+		}
+		a.RefreshSetup(context.Background())
+	}()
+}
+
+// InstallRequired installs every required dependency that is missing.
+func (a *App) InstallRequired() {
+	deps, _, _, running := a.SetupState()
+	if running {
+		return
+	}
+	for _, d := range deps {
+		if d.Required && d.Status == setup.StatusMissing && d.Installable {
+			a.InstallDep(d.ID)
+			return
+		}
 	}
 }
 
@@ -327,19 +417,25 @@ func (a *App) View(c *ui.Context) {
 	ui.Column(c).Fill().Background(tk.BgLayout).Children(func() {
 		a.header(c, tk)
 		ui.Divider(c)
-		ui.Row(c).Grow(1).Basis(0).MinHeight(0).AlignItems(ui.Stretch).Children(func() {
-			a.sidebar(c, tk)
-			ui.Column(c).Grow(1).Basis(0).MinHeight(0).Padding(16).Gap(12).Children(func() {
-				switch a.Mode {
-				case ModeCompat:
-					a.compatPanel(c, tk)
-				case ModeAutomation:
-					a.automationPanel(c, tk)
-				default:
-					a.perfPanel(c, tk)
-				}
+		if a.ShowSetup {
+			ui.Column(c).Grow(1).Basis(0).MinHeight(0).Padding(16).Children(func() {
+				a.setupPanel(c, tk)
 			})
-		})
+		} else {
+			ui.Row(c).Grow(1).Basis(0).MinHeight(0).AlignItems(ui.Stretch).Children(func() {
+				a.sidebar(c, tk)
+				ui.Column(c).Grow(1).Basis(0).MinHeight(0).Padding(16).Gap(12).Children(func() {
+					switch a.Mode {
+					case ModeCompat:
+						a.compatPanel(c, tk)
+					case ModeAutomation:
+						a.automationPanel(c, tk)
+					default:
+						a.perfPanel(c, tk)
+					}
+				})
+			})
+		}
 		a.footer(c, tk)
 	})
 }
@@ -347,9 +443,21 @@ func (a *App) View(c *ui.Context) {
 func (a *App) header(c *ui.Context, tk *theme.Tokens) {
 	ui.Row(c).Padding(12, 16).Gap(12).AlignItems(ui.Center).Children(func() {
 		ui.Text(c, version.Product).FontSize(22).Bold().TextColor(tk.Text)
+		if a.ShowSetup {
+			ui.Badge(c, "环境安装")
+			ui.Spacer(c)
+			if ui.Button(c, "返回工作台").Clicked() {
+				a.ShowSetup = false
+			}
+			return
+		}
 		ui.Badge(c, "对标 PerfDog")
 		ui.Segmented(c, &a.Mode, "PerfDog 性能", "兼容性", "自动化")
 		ui.Spacer(c)
+		if ui.Button(c, "环境").Clicked() {
+			a.ShowSetup = true
+			go a.RefreshSetup(context.Background())
+		}
 		if a.IsRunning() {
 			ui.Badge(c, "● 采集中")
 		} else {
@@ -593,6 +701,93 @@ func (a *App) sampleTable(c *ui.Context, tk *theme.Tokens, samples []perf.Sample
 	})
 }
 
+// setupPanel is the environment installer: each dependency can be installed
+// on its own, adb is marked required, and the USB driver is explicitly
+// manual rather than a fake one-click button.
+func (a *App) setupPanel(c *ui.Context, tk *theme.Tokens) {
+	deps, dir, msg, running := a.SetupState()
+	missingRequired := false
+	for _, d := range deps {
+		if d.Required && d.Status == setup.StatusMissing {
+			missingRequired = true
+		}
+	}
+
+	ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
+		ui.Text(c, "环境安装").FontSize(18).Bold().TextColor(tk.Text)
+		ui.Badge(c, "独立工具")
+		ui.Spacer(c)
+		if ui.Button(c, "重新检测").Clicked() && !running {
+			go a.RefreshSetup(context.Background())
+		}
+	})
+	ui.Text(c, "只装你需要的。adb 必装；scrcpy 可选；USB 驱动由厂商提供，QAWork 不代装。").
+		FontSize(12).TextColor(tk.TextSecondary).Wrap()
+	if dir != "" {
+		ui.Text(c, "安装目录： "+dir+"（只写当前用户 PATH，不需要管理员权限）").
+			FontSize(11).TextColor(tk.TextTertiary).Wrap()
+	}
+
+	ui.Scroll(c).Grow(1).Basis(0).MinHeight(0).Children(func() {
+		ui.Column(c).Gap(8).Children(func() {
+			if len(deps) == 0 {
+				ui.Text(c, "正在检测 adb / scrcpy…").FontSize(12).TextColor(tk.TextTertiary)
+			}
+			for _, d := range deps {
+				a.setupRow(c, tk, d, running)
+			}
+		})
+	})
+
+	ui.Divider(c)
+	ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
+		if missingRequired && !running {
+			if ui.PrimaryButton(c, "一键安装必装").Clicked() {
+				a.InstallRequired()
+			}
+		}
+		ui.Text(c, msg).FontSize(11).TextColor(tk.TextSecondary).Wrap()
+	})
+}
+
+func (a *App) setupRow(c *ui.Context, tk *theme.Tokens, d setup.Dep, running bool) {
+	ui.Column(c).FillWidth().Padding(12).Gap(5).
+		Background(tk.BgContainer).Radius(tk.BorderRadius).Border(1, tk.Border).Children(func() {
+		ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
+			ui.Text(c, d.Name).FontSize(14).Bold().TextColor(tk.Text)
+			if d.Required {
+				ui.Badge(c, "必装")
+			} else {
+				ui.Badge(c, "可选")
+			}
+			ui.Spacer(c)
+			switch d.Status {
+			case setup.StatusOK:
+				ui.Badge(c, "已安装")
+			case setup.StatusManual:
+				ui.Badge(c, "需手动")
+			default:
+				ui.Badge(c, "未安装")
+			}
+			if d.Installable && d.Status != setup.StatusOK && !running {
+				if ui.Button(c, "安装").Clicked() {
+					a.InstallDep(d.ID)
+				}
+			}
+		})
+		ui.Text(c, d.Description).FontSize(11).TextColor(tk.TextSecondary).Wrap()
+		if d.Version != "" {
+			ui.Text(c, d.Version).FontSize(11).TextColor(tk.TextTertiary).NoWrap()
+		}
+		if d.Path != "" && d.Status == setup.StatusOK {
+			ui.Text(c, d.Path).FontSize(11).TextColor(tk.TextTertiary).NoWrap()
+		}
+		if d.Note != "" {
+			ui.Text(c, d.Note).FontSize(11).TextColor(tk.TextTertiary).Wrap()
+		}
+	})
+}
+
 func (a *App) compatPanel(c *ui.Context, tk *theme.Tokens) {
 	ui.Column(c).Gap(10).Children(func() {
 		ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
@@ -635,8 +830,12 @@ func (a *App) automationPanel(c *ui.Context, tk *theme.Tokens) {
 }
 
 func (a *App) footer(c *ui.Context, tk *theme.Tokens) {
+	status := a.Status()
+	if a.ShowSetup {
+		status = "环境安装：只写当前用户目录与 PATH，不需要管理员权限"
+	}
 	ui.Row(c).Padding(8, 16).Gap(12).AlignItems(ui.Center).Background(tk.BgContainer).Children(func() {
-		ui.Text(c, a.Status()).FontSize(11).TextColor(tk.TextSecondary).NoWrap()
+		ui.Text(c, status).FontSize(11).TextColor(tk.TextSecondary).NoWrap()
 		ui.Spacer(c)
 		if path := a.SavedPath(); path != "" {
 			ui.Text(c, filepath.Base(path)).FontSize(11).TextColor(tk.TextTertiary).NoWrap()

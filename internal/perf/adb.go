@@ -41,10 +41,10 @@ func (a ADB) Shell(ctx context.Context, serial, command string) (string, error) 
 
 // Device is one entry of "adb devices -l".
 type Device struct {
-	Serial  string
-	State   string
-	Model   string
-	Product string
+	Serial  string `json:"serial"`
+	State   string `json:"state"`
+	Model   string `json:"model,omitempty"`
+	Product string `json:"product,omitempty"`
 }
 
 // Label is the line the device list shows.

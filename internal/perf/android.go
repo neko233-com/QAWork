@@ -349,7 +349,7 @@ func ParseBatteryTemperature(out string) float64 {
 		if err != nil {
 			return 0
 		}
-		return v / 10
+		return math.Max(0, v/10)
 	}
 	return 0
 }

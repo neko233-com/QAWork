@@ -32,6 +32,10 @@ func main() {
 		os.Exit(cmdPerf(os.Args[2:]))
 	case "report":
 		os.Exit(cmdReport(os.Args[2:]))
+	case "setup":
+		os.Exit(cmdSetup(os.Args[2:]))
+	case "mcp":
+		os.Exit(cmdMCP())
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -48,6 +52,8 @@ func usage() {
   qawork devices [-adb PATH] [-json]        列出 adb 设备
   qawork perf -package PKG [-serial S] ...  采集一次并写 CSV，失败退出码 2
   qawork report -csv FILE                   汇总 CSV 并按阈值判定
+  qawork setup [check|install] [-id adb]    检查/安装 adb、scrcpy（只写用户 PATH）
+  qawork mcp                                stdio MCP 服务，给 agent 直接调
 
 perf 常用参数:
   -serial 设备序列号（local 采集本机进程）  -package Android 包名或 PC 进程名
