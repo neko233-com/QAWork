@@ -28,6 +28,8 @@ func cmdCompat(args []string) int {
 	adbPath := fs.String("adb", "", "adb 可执行文件")
 	asJSON := fs.Bool("json", false, "输出 JSON")
 	timeout := fs.Duration("timeout", 10*time.Minute, "单个 case 超时")
+	repeat := fs.Int("repeat", 1, "每个 case 每台设备重复轮数，上限 100")
+	resetData := fs.Bool("reset", false, "每轮前 pm clear 应用数据")
 	fs.Parse(args)
 
 	var plan *automation.Plan
@@ -65,6 +67,7 @@ func cmdCompat(args []string) int {
 	matrix, err := compat.Run(ctx, compat.Options{
 		ADB: adb, Plan: plan, CaseName: *caseName, Package: *pkg, APKPath: *apkPath,
 		Devices: devices, ArtifactsRoot: root, Timeout: *timeout,
+		Repeat: *repeat, ResetData: *resetData,
 		OnDevice: func(serial string, done, total int) {
 			fmt.Fprintf(os.Stderr, "[%d/%d] %s ...\n", done, total, serial)
 		},
@@ -78,24 +81,23 @@ func cmdCompat(args []string) int {
 		enc.SetIndent("", "  ")
 		enc.Encode(matrix)
 	} else {
-		fmt.Printf("兼容矩阵：%d 台设备 × %d 个用例，%.1fs\n", matrix.Devices, matrix.Cases, matrix.DurationSeconds)
-		fmt.Println("SERIAL\tMODEL\tANDROID\tCASE\tINSTALL\tSTARTUP\tFPS\tJANK\tCPU\tMEM\tCRASH\tANR\tPASS")
+		fmt.Printf("兼容矩阵：%d 台设备 × %d 个用例 × %d 轮，%.1fs\n", matrix.Devices, matrix.Cases, matrix.Runs, matrix.DurationSeconds)
+		fmt.Println("SERIAL\tMODEL\tANDROID\tCASE\tRUN\tINSTALL\tSTARTUP\tFPS\tJANK\tCPU\tMEM\tCRASH\tANR\tPASS")
 		for _, r := range matrix.Rows {
 			inst := "跳过"
 			if !r.InstallSkipped {
 				inst = fmt.Sprintf("%v", r.Installed)
 			}
-			fmt.Printf("%s\t%s\t%s\t%s\t%s\t%.0f\t%.1f\t%.1f%%\t%.0f%%\t%.0fMB\t%v\t%v\t%v\n",
-				r.Serial, r.Model, r.Android, r.Case, inst, r.StartupMS, r.FPSMean, r.JankPct, r.CPUMax, r.MemMaxMB, r.Crash, r.ANR, !r.Failed)
+			fmt.Printf("%s\t%s\t%s\t%s\t%d\t%s\t%.0f\t%.1f\t%.1f%%\t%.0f%%\t%.0fMB\t%v\t%v\t%v\n",
+				r.Serial, r.Model, r.Android, r.Case, r.Run, inst, r.StartupMS, r.FPSMean, r.JankPct, r.CPUMax, r.MemMaxMB, r.Crash, r.ANR, !r.Failed)
 			if r.Error != "" {
 				fmt.Printf("  error: %s\n", r.Error)
 			}
 		}
-		if matrix.CSV != "" {
-			fmt.Println("CSV:", matrix.CSV)
-		}
-		if matrix.JSON != "" {
-			fmt.Println("JSON:", matrix.JSON)
+		for _, p := range []string{matrix.CSV, matrix.JSON, matrix.HTML, matrix.JUnit} {
+			if p != "" {
+				fmt.Println("产物:", p)
+			}
 		}
 	}
 	if matrix.Failed {

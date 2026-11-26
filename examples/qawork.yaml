@@ -6,7 +6,7 @@
 version: 1
 
 defaults:
-  # 留空则自动取第一台在线设备；CI 建议写死序列号。
+  # 留空则自动取第一台在线设备；本地脚本/Agent 建议写死序列号。
   serial: ""
   interval: 1s
   warmup: 1s
@@ -27,6 +27,10 @@ cases:
     steps:
       - action: launch
         cold: true
+      - action: wait_activity
+        activity: .Settings
+        timeout_ms: 10000
+      - action: assert_package
       - action: wait
         seconds: 1
       - action: swipe
@@ -49,5 +53,6 @@ cases:
     # 系统设置不是游戏，演示阈值放宽；游戏请用 defaults 或自己的值。
     assert:
       min_fps: 20
-      max_frame_p95_ms: 50
+      max_jank: 20
+      max_frame_p95_ms: 80
       max_startup_ms: 5000

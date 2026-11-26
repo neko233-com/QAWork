@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/neko233-com/QAWork/internal/adbkit"
 	"github.com/neko233-com/QAWork/internal/perf"
 )
 
@@ -265,6 +266,103 @@ func (r *Runner) runStep(ctx context.Context, index int, s Step) (StepResult, er
 		}
 		sr.Artifact = path
 		sr.Detail = path
+	case "stop":
+		if _, err := r.Device.Shell(ctx, "am force-stop "+r.Config.Case.Package); err != nil {
+			sr.Error = err.Error()
+			return sr, err
+		}
+		sr.Detail = "force-stop " + r.Config.Case.Package
+	case "clear":
+		out, err := r.Device.Shell(ctx, "pm clear "+r.Config.Case.Package)
+		if err != nil {
+			sr.Error = err.Error()
+			return sr, err
+		}
+		if !strings.Contains(strings.ToLower(out), "success") {
+			sr.Error = "pm clear 未返回 Success: " + strings.TrimSpace(out)
+			return sr, fmt.Errorf("%s", sr.Error)
+		}
+		sr.Detail = "清数据 " + r.Config.Case.Package
+	case "grant", "revoke":
+		if err := r.changePermissions(ctx, s.Action, s.Permissions); err != nil {
+			sr.Error = err.Error()
+			return sr, err
+		}
+		sr.Detail = s.Action + " " + strings.Join(s.Permissions, ",")
+	case "longpress", "drag":
+		cmd, err := StepCommand(s)
+		if err != nil {
+			sr.Error = err.Error()
+			return sr, err
+		}
+		if _, err := r.Device.Shell(ctx, cmd); err != nil {
+			sr.Error = err.Error()
+			return sr, err
+		}
+		sr.Detail = cmd
+	case "doubletap":
+		tap := fmt.Sprintf("input tap %d %d", s.X, s.Y)
+		if _, err := r.Device.Shell(ctx, tap); err != nil {
+			sr.Error = err.Error()
+			return sr, err
+		}
+		if err := sleepCtx(ctx, 120*time.Millisecond); err != nil {
+			sr.Error = err.Error()
+			return sr, err
+		}
+		if _, err := r.Device.Shell(ctx, tap); err != nil {
+			sr.Error = err.Error()
+			return sr, err
+		}
+		sr.Detail = "doubletap " + tap
+	case "wait_activity":
+		want := activityTarget(s)
+		act, err := r.waitActivity(ctx, want, stepTimeout(s))
+		if err != nil {
+			sr.Error = err.Error()
+			return sr, err
+		}
+		sr.Detail = "当前 " + act
+	case "wait_text":
+		if err := r.waitText(ctx, s.Text, stepTimeout(s)); err != nil {
+			sr.Error = err.Error()
+			return sr, err
+		}
+		sr.Detail = "出现文本 " + s.Text
+	case "assert_activity":
+		act, err := adbkit.CurrentActivity(ctx, r.Device)
+		if err != nil {
+			sr.Error = err.Error()
+			return sr, err
+		}
+		if !adbkit.ActivityMatches(act, activityTarget(s)) {
+			sr.Error = fmt.Sprintf("当前 activity %q，期望 %q", act, activityTarget(s))
+			return sr, fmt.Errorf("%s", sr.Error)
+		}
+		sr.Detail = "activity " + act
+	case "assert_text", "assert_not_text":
+		xmlText, err := adbkit.DumpUI(ctx, r.Device)
+		if err != nil {
+			sr.Error = err.Error()
+			return sr, err
+		}
+		has := adbkit.UIHasText(xmlText, s.Text)
+		if s.Action == "assert_text" && !has {
+			sr.Error = fmt.Sprintf("界面没有文本 %q", s.Text)
+			return sr, fmt.Errorf("%s", sr.Error)
+		}
+		if s.Action == "assert_not_text" && has {
+			sr.Error = fmt.Sprintf("界面出现了不该出现的文本 %q", s.Text)
+			return sr, fmt.Errorf("%s", sr.Error)
+		}
+		sr.Detail = s.Action + " " + s.Text
+	case "assert_package":
+		out, err := r.Device.Shell(ctx, "pidof "+r.Config.Case.Package)
+		if err != nil || strings.TrimSpace(out) == "" {
+			sr.Error = "进程不在: " + r.Config.Case.Package
+			return sr, fmt.Errorf("%s", sr.Error)
+		}
+		sr.Detail = "pid " + strings.TrimSpace(out)
 	default:
 		cmd, err := StepCommand(s)
 		if err != nil {
@@ -278,6 +376,71 @@ func (r *Runner) runStep(ctx context.Context, index int, s Step) (StepResult, er
 		sr.Detail = cmd
 	}
 	return sr, nil
+}
+
+func (r *Runner) changePermissions(ctx context.Context, verb string, permissions []string) error {
+	for _, p := range permissions {
+		p = strings.TrimSpace(p)
+		if _, err := r.Device.Shell(ctx, "pm "+verb+" "+r.Config.Case.Package+" "+p); err != nil {
+			return fmt.Errorf("%s %s: %w", verb, p, err)
+		}
+	}
+	return nil
+}
+
+func (r *Runner) waitActivity(ctx context.Context, want string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	var last string
+	var lastErr error
+	for {
+		act, err := adbkit.CurrentActivity(ctx, r.Device)
+		if err == nil {
+			last = act
+			if adbkit.ActivityMatches(act, want) {
+				return act, nil
+			}
+		} else {
+			lastErr = err
+		}
+		if ctx.Err() != nil {
+			return last, ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return last, fmt.Errorf("等待 activity %q 超时: %v", want, lastErr)
+			}
+			return last, fmt.Errorf("等待 activity %q 超时，当前 %q", want, last)
+		}
+		if err := sleepCtx(ctx, 500*time.Millisecond); err != nil {
+			return last, err
+		}
+	}
+}
+
+func (r *Runner) waitText(ctx context.Context, want string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		xmlText, err := adbkit.DumpUI(ctx, r.Device)
+		if err == nil && adbkit.UIHasText(xmlText, want) {
+			return nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return fmt.Errorf("等待文本 %q 超时: %v", want, lastErr)
+			}
+			return fmt.Errorf("等待文本 %q 超时", want)
+		}
+		if err := sleepCtx(ctx, 500*time.Millisecond); err != nil {
+			return err
+		}
+	}
 }
 
 func (r *Runner) captureFailure(ctx context.Context, res *Result) {
@@ -343,6 +506,23 @@ func stepDuration(s Step) time.Duration {
 		return time.Duration(s.MS) * time.Millisecond
 	}
 	return 0
+}
+
+func stepTimeout(s Step) time.Duration {
+	if s.TimeoutMS <= 0 {
+		return 10 * time.Second
+	}
+	if s.TimeoutMS > 120000 {
+		return 120 * time.Second
+	}
+	return time.Duration(s.TimeoutMS) * time.Millisecond
+}
+
+func activityTarget(s Step) string {
+	if strings.TrimSpace(s.Activity) != "" {
+		return s.Activity
+	}
+	return s.Text
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {

@@ -129,17 +129,32 @@ func StepCommand(s Step) (string, error) {
 	switch s.Action {
 	case "tap":
 		return fmt.Sprintf("input tap %d %d", s.X, s.Y), nil
+	case "longpress":
+		dur := s.DurationMS
+		if dur <= 0 {
+			dur = 800
+		}
+		return fmt.Sprintf("input swipe %d %d %d %d %d", s.X, s.Y, s.X, s.Y, dur), nil
 	case "swipe":
 		dur := s.DurationMS
 		if dur <= 0 {
 			dur = 300
 		}
 		return fmt.Sprintf("input swipe %d %d %d %d %d", s.X, s.Y, s.X2, s.Y2, dur), nil
+	case "drag":
+		dur := s.DurationMS
+		if dur <= 0 {
+			dur = 800
+		}
+		return fmt.Sprintf("input swipe %d %d %d %d %d", s.X, s.Y, s.X2, s.Y2, dur), nil
+	case "doubletap":
+		return "", fmt.Errorf("doubletap 由 runner 连续点击处理")
 	case "keyevent":
 		return "input keyevent " + quoteShell(s.Key), nil
 	case "text":
 		return "input text " + quoteShell(encodeInputText(s.Text)), nil
-	case "wait", "launch", "screenshot":
+	case "wait", "launch", "screenshot", "stop", "clear", "grant", "revoke",
+		"wait_activity", "wait_text", "assert_activity", "assert_text", "assert_not_text", "assert_package":
 		return "", nil
 	default:
 		return "", fmt.Errorf("未知动作 %q", s.Action)

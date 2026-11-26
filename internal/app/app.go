@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/neko233-com/QAWork/internal/compat"
 	"github.com/neko233-com/QAWork/internal/perf"
 	"github.com/neko233-com/QAWork/internal/setup"
+	"github.com/neko233-com/QAWork/internal/stress"
 	"github.com/neko233-com/QAWork/internal/version"
 )
 
@@ -41,13 +43,14 @@ const (
 	tableSamples   = 40
 )
 
-// The workbench declares three modes. PerfDog performance capture is the
-// default; compatibility and automation are real adb workflows now, each
+// The workbench declares four modes. PerfDog performance capture is the
+// default; compatibility, automation and stress are real adb workflows, each
 // with its own panel. The numbering is part of the app's public shape.
 const (
 	ModePerfDog = iota
 	ModeCompat
 	ModeAutomation
+	ModeStress
 )
 
 // App is the state of the workbench.
@@ -103,6 +106,15 @@ type App struct {
 	compatRunning  bool
 	compatMatrix   compat.Matrix
 	compatTable    ui.ListState
+	compatRepeat   string
+	compatReset    string
+
+	// Stress panel.
+	stressPackage  string
+	stressDuration string
+	stressMsg      string
+	stressRunning  bool
+	stressResult   stress.Result
 }
 
 // New returns the workbench in its default mode: PerfDog-style performance
@@ -117,6 +129,9 @@ func New(host Host) *App {
 		Thresholds:         perf.DefaultThresholds(),
 		Host:               host,
 		automationPlanPath: "qawork.yaml",
+		stressDuration:     "2 分钟",
+		compatRepeat:       "1 轮",
+		compatReset:        "不清数据",
 		status:             "就绪：默认 PerfDog 性能模式",
 	}
 }
@@ -316,9 +331,9 @@ func (a *App) RunPlan() {
 		a.mu.Unlock()
 		return
 	}
-	if a.running {
+	if a.running || a.compatRunning || a.stressRunning {
 		a.mu.Unlock()
-		a.setAutomationMsg("先停止性能采集")
+		a.setAutomationMsg("先停止性能采集/兼容矩阵/压测")
 		return
 	}
 	path := a.automationPlanPath
@@ -424,15 +439,17 @@ func (a *App) RunCompat() {
 		a.mu.Unlock()
 		return
 	}
-	if a.running {
+	if a.running || a.automationRunning || a.stressRunning {
 		a.mu.Unlock()
-		a.setCompatMsg("先停止性能采集")
+		a.setCompatMsg("先停止性能采集/自动化/压测")
 		return
 	}
 	planPath := a.compatPlanPath
 	pkg := a.compatPackage
 	apk := a.compatAPK
 	caseName := a.compatCase
+	repeat := compatRepeatValue(a.compatRepeat)
+	reset := a.compatReset == "每轮清数据"
 	a.compatRunning = true
 	a.compatMatrix = compat.Matrix{}
 	a.compatMsg = "准备兼容矩阵…"
@@ -460,7 +477,7 @@ func (a *App) RunCompat() {
 	go func() {
 		m, err := compat.Run(context.Background(), compat.Options{
 			ADB: a.ADB, Plan: plan, Package: pkg, CaseName: caseName, APKPath: apk,
-			ArtifactsRoot: root, Timeout: 10 * time.Minute,
+			ArtifactsRoot: root, Timeout: 10 * time.Minute, Repeat: repeat, ResetData: reset,
 			OnDevice: func(serial string, done, total int) {
 				a.setCompatMsg(fmt.Sprintf("[%d/%d] %s …", done, total, serial))
 			},
@@ -477,7 +494,7 @@ func (a *App) RunCompat() {
 					failed++
 				}
 			}
-			a.compatMsg = fmt.Sprintf("完成：%d 台 × %d 个用例，%d 行失败", m.Devices, m.Cases, failed)
+			a.compatMsg = fmt.Sprintf("完成：%d 台 × %d 个用例 × %d 轮，%d 行失败", m.Devices, m.Cases, m.Runs, failed)
 		}
 		a.mu.Unlock()
 		if host != nil {
@@ -524,6 +541,108 @@ func (a *App) finishCompat(msg string) {
 	}
 }
 
+// RunStress launches one real monkey stress run against the selected Android
+// device. It never writes a pass when monkey or sampling failed.
+func (a *App) RunStress() {
+	a.mu.Lock()
+	if a.stressRunning {
+		a.mu.Unlock()
+		return
+	}
+	if a.running || a.automationRunning || a.compatRunning {
+		a.stressMsg = "先停止性能采集/自动化/兼容矩阵"
+		a.mu.Unlock()
+		return
+	}
+	pkg := strings.TrimSpace(a.stressPackage)
+	if pkg == "" {
+		a.stressMsg = "先填要压测的 Android 包名"
+		a.mu.Unlock()
+		return
+	}
+	serial := a.Serial
+	if serial == "local" {
+		serial = ""
+	}
+	duration := stressDurationValue(a.stressDuration)
+	artifacts := filepath.Join(setup.HomeDir(), "stress", time.Now().Format("20060102-150405"))
+	a.stressRunning = true
+	a.stressResult = stress.Result{Package: pkg, Serial: serial}
+	a.stressMsg = "压测中：" + pkg
+	a.mu.Unlock()
+
+	go func() {
+		res, err := stress.Run(context.Background(), stress.Options{
+			ADB: a.ADB, Serial: serial, Package: pkg, Duration: duration,
+			Events: 3000, ThrottleMS: 300, Interval: time.Second, ArtifactsRoot: artifacts,
+		})
+		a.mu.Lock()
+		a.stressRunning = false
+		if err != nil {
+			a.stressResult = stress.Result{Package: pkg, Serial: serial, Failed: true, Error: err.Error()}
+			a.stressMsg = "压测失败：" + err.Error()
+		} else {
+			a.stressResult = res
+			if res.Crash {
+				a.stressMsg = "完成：检测到 crash"
+			} else if res.ANR {
+				a.stressMsg = "完成：检测到 ANR"
+			} else if res.Failed {
+				a.stressMsg = "完成：" + res.Error
+			} else {
+				a.stressMsg = fmt.Sprintf("完成：%d 个样本，无 crash/ANR", res.Samples)
+			}
+		}
+		a.mu.Unlock()
+		if a.Host != nil {
+			a.Host.Update(func() {})
+		}
+	}()
+}
+
+// StressState copies the stress panel state for drawing.
+func (a *App) StressState() (stress.Result, string, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.stressResult, a.stressMsg, a.stressRunning
+}
+
+// StressNotice is the footer line for stress mode.
+func (a *App) StressNotice() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.stressMsg != "" {
+		return a.stressMsg
+	}
+	return "压测：monkey 随机输入 + 性能采样，结束后按包名扫 crash/ANR"
+}
+
+func compatRepeatValue(label string) int {
+	switch label {
+	case "2 轮":
+		return 2
+	case "3 轮":
+		return 3
+	case "5 轮":
+		return 5
+	default:
+		return 1
+	}
+}
+
+func stressDurationValue(label string) time.Duration {
+	switch label {
+	case "1 分钟":
+		return time.Minute
+	case "10 分钟":
+		return 10 * time.Minute
+	case "30 分钟":
+		return 30 * time.Minute
+	default:
+		return 2 * time.Minute
+	}
+}
+
 // Devices returns the last device list.
 func (a *App) Devices() ([]perf.Device, string) {
 	a.mu.Lock()
@@ -540,8 +659,8 @@ func (a *App) Start() {
 		a.mu.Unlock()
 		return
 	}
-	if a.automationRunning || a.compatRunning {
-		a.lastErr = "自动化/兼容矩阵跑完再采性能"
+	if a.automationRunning || a.compatRunning || a.stressRunning {
+		a.lastErr = "自动化/兼容矩阵/压测跑完再采性能"
 		a.mu.Unlock()
 		return
 	}
@@ -702,6 +821,8 @@ func (a *App) View(c *ui.Context) {
 						a.compatPanel(c, tk)
 					case ModeAutomation:
 						a.automationPanel(c, tk)
+					case ModeStress:
+						a.stressPanel(c, tk)
 					default:
 						a.perfPanel(c, tk)
 					}
@@ -724,7 +845,7 @@ func (a *App) header(c *ui.Context, tk *theme.Tokens) {
 			return
 		}
 		ui.Badge(c, "对标 PerfDog")
-		ui.Segmented(c, &a.Mode, "PerfDog 性能", "兼容性", "自动化")
+		ui.Segmented(c, &a.Mode, "PerfDog 性能", "兼容性", "自动化", "压测")
 		ui.Spacer(c)
 		if ui.Button(c, "环境").Clicked() {
 			a.ShowSetup = true
@@ -803,6 +924,9 @@ func (a *App) sidebar(c *ui.Context, tk *theme.Tokens) {
 			a.thresholdLine(c, tk)
 		} else if a.Mode == ModeAutomation {
 			ui.Text(c, "自动化使用计划里的包名与步骤。这里选中的 Android 设备会覆盖计划 serial；选“本机进程”无效。").
+				FontSize(11).TextColor(tk.TextTertiary).Wrap()
+		} else if a.Mode == ModeStress {
+			ui.Text(c, "压测只跑 Android 真机/模拟器；选中设备留空则取第一台在线。").
 				FontSize(11).TextColor(tk.TextTertiary).Wrap()
 		} else {
 			ui.Text(c, "兼容矩阵默认跑所有在线 Android 设备；侧栏选择不限制批量范围。").
@@ -1079,7 +1203,7 @@ func (a *App) compatPanel(c *ui.Context, tk *theme.Tokens) {
 			ui.Text(c, "兼容性矩阵").FontSize(16).Bold().TextColor(tk.Text)
 			ui.Badge(c, "可用")
 		})
-		ui.Text(c, "所有在线 Android 设备 × 用例：批量安装 APK、冷启动、短采样、抓 crash/ANR，结果落本地 CSV/JSON。").
+		ui.Text(c, "所有在线 Android 设备 × 用例 × 重复轮次：批量安装 APK、冷启动、短采样、抓 crash/ANR，结果落 CSV/JSON/HTML/JUnit。").
 			FontSize(12).TextColor(tk.TextSecondary).Wrap()
 
 		ui.Row(c).Gap(8).AlignItems(ui.End).Children(func() {
@@ -1101,6 +1225,14 @@ func (a *App) compatPanel(c *ui.Context, tk *theme.Tokens) {
 				ui.Text(c, "只跑指定 case").FontSize(11).TextColor(tk.TextTertiary)
 				ui.TextInput(c, &a.compatCase).Placeholder("留空跑全部")
 			})
+			ui.Column(c).Width(100).Gap(3).Children(func() {
+				ui.Text(c, "重复轮次").FontSize(11).TextColor(tk.TextTertiary)
+				ui.Select(c, &a.compatRepeat, []string{"1 轮", "2 轮", "3 轮", "5 轮"})
+			})
+			ui.Column(c).Width(130).Gap(3).Children(func() {
+				ui.Text(c, "应用数据").FontSize(11).TextColor(tk.TextTertiary)
+				ui.Select(c, &a.compatReset, []string{"不清数据", "每轮清数据"})
+			})
 			if running {
 				ui.Badge(c, "运行中")
 			} else if ui.PrimaryButton(c, "运行兼容矩阵").Clicked() {
@@ -1117,14 +1249,14 @@ func (a *App) compatPanel(c *ui.Context, tk *theme.Tokens) {
 				"多机型批量安装、冷启动、首帧耗时",
 				"型号 / Android / SDK / ABI / 分辨率矩阵",
 				"崩溃与 ANR 按包名扫描，避免别的 App 污染结果",
-				"矩阵 CSV/JSON 与每设备截图、logcat 一起落盘",
+				"矩阵 CSV/JSON + HTML 报告 + JUnit 与每设备截图、logcat 一起落盘",
 			} {
 				ui.Text(c, "· "+item).FontSize(12).TextColor(tk.TextSecondary).Wrap()
 			}
 			return
 		}
 
-		ui.Text(c, fmt.Sprintf("%d 台设备 × %d 个用例，%.1fs%s", matrix.Devices, matrix.Cases, matrix.DurationSeconds, passText(matrix.Failed))).
+		ui.Text(c, fmt.Sprintf("%d 台设备 × %d 个用例 × %d 轮，%.1fs%s", matrix.Devices, matrix.Cases, matrix.Runs, matrix.DurationSeconds, passText(matrix.Failed))).
 			FontSize(12).TextColor(tk.TextSecondary).Wrap()
 		ui.Scroll(c).Grow(1).Basis(0).MinHeight(0).Children(func() {
 			a.compatResultTable(c, tk, matrix.Rows)
@@ -1134,6 +1266,12 @@ func (a *App) compatPanel(c *ui.Context, tk *theme.Tokens) {
 		}
 		if matrix.JSON != "" {
 			ui.Text(c, "矩阵 JSON："+matrix.JSON).FontSize(11).TextColor(tk.TextTertiary).NoWrap()
+		}
+		if matrix.HTML != "" {
+			ui.Text(c, "HTML 报告："+matrix.HTML).FontSize(11).TextColor(tk.TextTertiary).NoWrap()
+		}
+		if matrix.JUnit != "" {
+			ui.Text(c, "JUnit："+matrix.JUnit).FontSize(11).TextColor(tk.TextTertiary).NoWrap()
 		}
 	})
 }
@@ -1195,6 +1333,66 @@ func (a *App) compatResultTable(c *ui.Context, tk *theme.Tokens, rows []compat.R
 	})
 }
 
+func (a *App) stressPanel(c *ui.Context, tk *theme.Tokens) {
+	res, msg, running := a.StressState()
+	ui.Column(c).Gap(10).Children(func() {
+		ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
+			ui.Text(c, "稳定性压测").FontSize(16).Bold().TextColor(tk.Text)
+			ui.Badge(c, "可用")
+		})
+		ui.Text(c, "monkey 长随机输入 + 全程性能采样，结束后按包名扫 logcat 的 crash/ANR，证据落 samples.csv 与 result.json。").
+			FontSize(12).TextColor(tk.TextSecondary).Wrap()
+		ui.Row(c).Gap(8).AlignItems(ui.End).Children(func() {
+			ui.Column(c).Grow(1).Basis(0).Gap(3).Children(func() {
+				ui.Text(c, "Android 包名").FontSize(11).TextColor(tk.TextTertiary)
+				ui.TextInput(c, &a.stressPackage).Placeholder("com.example.game")
+			})
+			ui.Column(c).Width(130).Gap(3).Children(func() {
+				ui.Text(c, "时长").FontSize(11).TextColor(tk.TextTertiary)
+				ui.Select(c, &a.stressDuration, []string{"1 分钟", "2 分钟", "10 分钟", "30 分钟"})
+			})
+			if running {
+				ui.Badge(c, "压测中")
+			} else if ui.PrimaryButton(c, "开始压测").Clicked() {
+				a.RunStress()
+			}
+		})
+		if msg != "" {
+			ui.Text(c, msg).FontSize(11).TextColor(tk.TextSecondary).Wrap()
+		}
+		if res.Package == "" {
+			ui.Divider(c)
+			for _, item := range []string{
+				"固定 3000 个 monkey 事件，默认 300ms 间隔，可被时长截断",
+				"边跑边采 FPS / frame P95 / CPU / 内存 / 温度",
+				"crash/ANR 按包名匹配，避免别的 App 污染",
+				"产物：samples.csv、result.json、logcat.txt、monkey.txt",
+			} {
+				ui.Text(c, "· "+item).FontSize(12).TextColor(tk.TextSecondary).Wrap()
+			}
+			return
+		}
+		ui.Divider(c)
+		ui.Row(c).Gap(18).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, fmt.Sprintf("样本 %d", res.Samples)).FontSize(12).TextColor(tk.TextSecondary)
+			ui.Text(c, "FPS "+fpsText(res.Summary.FPSMean)).FontSize(12).TextColor(tk.TextSecondary)
+			ui.Text(c, "P95 "+msText(res.Summary.FrameP95)).FontSize(12).TextColor(tk.TextSecondary)
+			ui.Text(c, "CPU "+pctText(res.Summary.CPUMax)).FontSize(12).TextColor(tk.TextSecondary)
+			ui.Text(c, "内存 "+mbText(res.Summary.MemMaxMB)).FontSize(12).TextColor(tk.TextSecondary)
+			ui.Text(c, "Crash "+yesNo(res.Crash)).FontSize(12).TextColor(tk.TextSecondary)
+			ui.Text(c, "ANR "+yesNo(res.ANR)).FontSize(12).TextColor(tk.TextSecondary)
+		})
+		if res.Error != "" {
+			ui.Text(c, "错误："+res.Error).FontSize(12).TextColor(tk.Error).Wrap()
+		}
+		for _, p := range []string{res.CSV, res.ResultJSON, res.Logcat, res.MonkeyFile} {
+			if p != "" {
+				ui.Text(c, p).FontSize(11).TextColor(tk.TextTertiary).NoWrap()
+			}
+		}
+	})
+}
+
 func (a *App) automationPanel(c *ui.Context, tk *theme.Tokens) {
 	results, msg, running := a.AutomationState()
 	ui.Column(c).Gap(10).Children(func() {
@@ -1202,7 +1400,7 @@ func (a *App) automationPanel(c *ui.Context, tk *theme.Tokens) {
 			ui.Text(c, "自动化用例").FontSize(16).Bold().TextColor(tk.Text)
 			ui.Badge(c, "可用")
 		})
-		ui.Text(c, "qawork.yaml 驱动 adb：launch / tap / swipe / wait / keyevent / text / screenshot，全程采样并盖性能门禁。").
+		ui.Text(c, "qawork.yaml 驱动 adb：launch / tap / 长按 / 双击 / swipe / drag / 按键 / 文本 / 权限 / 等待与断言 / 截图，全程采样并盖性能门禁。").
 			FontSize(12).TextColor(tk.TextSecondary).Wrap()
 
 		ui.Row(c).Gap(8).AlignItems(ui.End).Children(func() {
@@ -1237,8 +1435,9 @@ func (a *App) automationPanel(c *ui.Context, tk *theme.Tokens) {
 				"    package: com.example.game",
 				"    steps:",
 				"      - {action: launch, cold: true}",
+				"      - {action: wait_activity, activity: .Main}",
+				"      - {action: assert_package}",
 				"      - {action: tap, x: 540, y: 1600}",
-				"      - {action: wait, seconds: 8}",
 			} {
 				ui.Text(c, "  "+line).FontSize(12).TextColor(tk.TextSecondary).NoWrap()
 			}
@@ -1322,6 +1521,20 @@ func fpsText(v float64) string {
 	return fmt.Sprintf("%.1f", v)
 }
 
+func pctText(v float64) string {
+	if v <= 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.0f%%", v)
+}
+
+func mbText(v float64) string {
+	if v <= 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.0fMB", v)
+}
+
 func passText(failed bool) string {
 	if failed {
 		return "，有失败"
@@ -1378,6 +1591,8 @@ func (a *App) footer(c *ui.Context, tk *theme.Tokens) {
 		status = a.AutomationNotice()
 	} else if a.Mode == ModeCompat {
 		status = a.CompatNotice()
+	} else if a.Mode == ModeStress {
+		status = a.StressNotice()
 	}
 	ui.Row(c).Padding(8, 16).Gap(12).AlignItems(ui.Center).Background(tk.BgContainer).Children(func() {
 		ui.Text(c, status).FontSize(11).TextColor(tk.TextSecondary).NoWrap()

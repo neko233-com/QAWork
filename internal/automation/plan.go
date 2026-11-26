@@ -13,6 +13,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/neko233-com/QAWork/internal/adbkit"
 	"github.com/neko233-com/QAWork/internal/perf"
 )
 
@@ -49,17 +50,20 @@ type Case struct {
 
 // Step is one adb action. Only the fields the action needs are read.
 type Step struct {
-	Action     string  `yaml:"action" json:"action"`
-	X          int     `yaml:"x" json:"x,omitempty"`
-	Y          int     `yaml:"y" json:"y,omitempty"`
-	X2         int     `yaml:"x2" json:"x2,omitempty"`
-	Y2         int     `yaml:"y2" json:"y2,omitempty"`
-	DurationMS int     `yaml:"duration_ms" json:"duration_ms,omitempty"`
-	Seconds    float64 `yaml:"seconds" json:"seconds,omitempty"`
-	MS         int     `yaml:"ms" json:"ms,omitempty"`
-	Key        string  `yaml:"key" json:"key,omitempty"`
-	Text       string  `yaml:"text" json:"text,omitempty"`
-	Cold       *bool   `yaml:"cold" json:"cold,omitempty"`
+	Action      string   `yaml:"action" json:"action"`
+	X           int      `yaml:"x" json:"x,omitempty"`
+	Y           int      `yaml:"y" json:"y,omitempty"`
+	X2          int      `yaml:"x2" json:"x2,omitempty"`
+	Y2          int      `yaml:"y2" json:"y2,omitempty"`
+	DurationMS  int      `yaml:"duration_ms" json:"duration_ms,omitempty"`
+	Seconds     float64  `yaml:"seconds" json:"seconds,omitempty"`
+	MS          int      `yaml:"ms" json:"ms,omitempty"`
+	TimeoutMS   int      `yaml:"timeout_ms" json:"timeout_ms,omitempty"`
+	Key         string   `yaml:"key" json:"key,omitempty"`
+	Text        string   `yaml:"text" json:"text,omitempty"`
+	Activity    string   `yaml:"activity" json:"activity,omitempty"`
+	Permissions []string `yaml:"permissions" json:"permissions,omitempty"`
+	Cold        *bool    `yaml:"cold" json:"cold,omitempty"`
 }
 
 // Assert overrides limits. A nil field means "use the default"; an explicit
@@ -173,6 +177,8 @@ func (p *Plan) Validate() []error {
 		}
 		if c.Package == "" {
 			errs = append(errs, fmt.Errorf("%s.package 不能为空", prefix))
+		} else if !adbkit.ValidPackage(c.Package) {
+			errs = append(errs, fmt.Errorf("%s.package %q 不是合法 Android 包名", prefix, c.Package))
 		}
 		interval, err := durationOf(c.Interval, time.Second)
 		if err != nil || interval < 200*time.Millisecond || interval > 10*time.Second {
@@ -195,8 +201,8 @@ func (p *Plan) Validate() []error {
 
 func validateSteps(prefix string, steps []Step) []error {
 	var errs []error
-	if len(steps) > 100 {
-		errs = append(errs, fmt.Errorf("%s.steps 最多 100 步", prefix))
+	if len(steps) > 200 {
+		errs = append(errs, fmt.Errorf("%s.steps 最多 200 步", prefix))
 	}
 	for i, s := range steps {
 		where := fmt.Sprintf("%s.steps[%d]", prefix, i)
@@ -206,22 +212,31 @@ func validateSteps(prefix string, steps []Step) []error {
 				errs = append(errs, fmt.Errorf("%s.launch 只能是第一步（采样器启动后强退会让 PID 失效）", where))
 			}
 		case "wait":
-			if s.Seconds <= 0 && s.MS <= 0 {
-				errs = append(errs, fmt.Errorf("%s.wait 需要 seconds 或 ms", where))
-			}
-			if s.Seconds > 120 || s.MS > 120000 {
-				errs = append(errs, fmt.Errorf("%s.wait 最多 120s", where))
-			}
+			errs = append(errs, validateWait(where, s)...)
 		case "tap":
 			if s.X < 0 || s.Y < 0 {
 				errs = append(errs, fmt.Errorf("%s.tap 需要非负 x/y", where))
 			}
-		case "swipe":
-			if s.X < 0 || s.Y < 0 || s.X2 < 0 || s.Y2 < 0 {
-				errs = append(errs, fmt.Errorf("%s.swipe 需要非负 x/y/x2/y2", where))
+		case "longpress":
+			if s.X < 0 || s.Y < 0 {
+				errs = append(errs, fmt.Errorf("%s.longpress 需要非负 x/y", where))
 			}
 			if s.DurationMS < 0 || s.DurationMS > 5000 {
+				errs = append(errs, fmt.Errorf("%s.longpress duration_ms 需在 0–5000", where))
+			}
+		case "doubletap":
+			if s.X < 0 || s.Y < 0 {
+				errs = append(errs, fmt.Errorf("%s.doubletap 需要非负 x/y", where))
+			}
+		case "swipe":
+			errs = append(errs, validateCoords(where, s, "swipe")...)
+			if s.DurationMS < 0 || s.DurationMS > 5000 {
 				errs = append(errs, fmt.Errorf("%s.swipe duration_ms 需在 0–5000", where))
+			}
+		case "drag":
+			errs = append(errs, validateCoords(where, s, "drag")...)
+			if s.DurationMS < 0 || s.DurationMS > 5000 {
+				errs = append(errs, fmt.Errorf("%s.drag duration_ms 需在 0–5000", where))
 			}
 		case "keyevent":
 			if strings.TrimSpace(s.Key) == "" {
@@ -237,11 +252,62 @@ func validateSteps(prefix string, steps []Step) []error {
 			if len(s.Text) > 300 {
 				errs = append(errs, fmt.Errorf("%s.text 最多 300 字符", where))
 			}
+		case "stop", "clear", "assert_package":
+			// package comes from the case
+		case "grant", "revoke":
+			if len(s.Permissions) == 0 {
+				errs = append(errs, fmt.Errorf("%s.%s 需要 permissions", where, s.Action))
+			}
+			for _, p := range s.Permissions {
+				if !adbkit.ValidPermission(strings.TrimSpace(p)) {
+					errs = append(errs, fmt.Errorf("%s.%s 权限名无效: %q", where, s.Action, p))
+				}
+			}
+		case "wait_activity", "assert_activity":
+			if strings.TrimSpace(s.Activity) == "" && strings.TrimSpace(s.Text) == "" {
+				errs = append(errs, fmt.Errorf("%s.%s 需要 activity 或 text", where, s.Action))
+			}
+			if len(s.Activity) > 200 || len(s.Text) > 200 {
+				errs = append(errs, fmt.Errorf("%s.%s 目标最多 200 字符", where, s.Action))
+			}
+			if s.TimeoutMS < 0 || s.TimeoutMS > 120000 {
+				errs = append(errs, fmt.Errorf("%s.%s timeout_ms 需在 0–120000", where, s.Action))
+			}
+		case "wait_text":
+			if strings.TrimSpace(s.Text) == "" {
+				errs = append(errs, fmt.Errorf("%s.%s 需要 text", where, s.Action))
+			}
+			if s.TimeoutMS < 0 || s.TimeoutMS > 120000 {
+				errs = append(errs, fmt.Errorf("%s.%s timeout_ms 需在 0–120000", where, s.Action))
+			}
+		case "assert_text", "assert_not_text":
+			if strings.TrimSpace(s.Text) == "" {
+				errs = append(errs, fmt.Errorf("%s.%s 需要 text", where, s.Action))
+			}
 		case "screenshot":
 			// no fields
 		default:
-			errs = append(errs, fmt.Errorf("%s.action %q 不支持（launch/wait/tap/swipe/keyevent/text/screenshot）", where, s.Action))
+			errs = append(errs, fmt.Errorf("%s.action %q 不支持（launch/wait/tap/longpress/doubletap/swipe/drag/keyevent/text/stop/clear/grant/revoke/wait_activity/wait_text/assert_activity/assert_text/assert_not_text/assert_package/screenshot）", where, s.Action))
 		}
+	}
+	return errs
+}
+
+func validateWait(where string, s Step) []error {
+	var errs []error
+	if s.Seconds <= 0 && s.MS <= 0 {
+		errs = append(errs, fmt.Errorf("%s.wait 需要 seconds 或 ms", where))
+	}
+	if s.Seconds > 120 || s.MS > 120000 {
+		errs = append(errs, fmt.Errorf("%s.wait 最多 120s", where))
+	}
+	return errs
+}
+
+func validateCoords(where string, s Step, action string) []error {
+	var errs []error
+	if s.X < 0 || s.Y < 0 || s.X2 < 0 || s.Y2 < 0 {
+		errs = append(errs, fmt.Errorf("%s.%s 需要非负 x/y/x2/y2", where, action))
 	}
 	return errs
 }

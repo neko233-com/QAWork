@@ -160,11 +160,15 @@ func TestStepCommand(t *testing.T) {
 		want string
 	}{
 		{Step{Action: "tap", X: 100, Y: 200}, "input tap 100 200"},
+		{Step{Action: "longpress", X: 10, Y: 20}, "input swipe 10 20 10 20 800"},
 		{Step{Action: "swipe", X: 1, Y: 2, X2: 3, Y2: 4}, "input swipe 1 2 3 4 300"},
 		{Step{Action: "swipe", X: 1, Y: 2, X2: 3, Y2: 4, DurationMS: 500}, "input swipe 1 2 3 4 500"},
+		{Step{Action: "drag", X: 1, Y: 2, X2: 3, Y2: 4}, "input swipe 1 2 3 4 800"},
 		{Step{Action: "keyevent", Key: "26"}, "input keyevent '26'"},
 		{Step{Action: "text", Text: "hello world"}, "input text 'hello%sworld'"},
 		{Step{Action: "wait"}, ""},
+		{Step{Action: "stop"}, ""},
+		{Step{Action: "assert_package"}, ""},
 		{Step{Action: "screenshot"}, ""},
 	}
 	for _, c := range cases {
@@ -177,8 +181,89 @@ func TestStepCommand(t *testing.T) {
 			t.Errorf("%s = %q, want %q", c.step.Action, got, c.want)
 		}
 	}
+	if _, err := StepCommand(Step{Action: "doubletap", X: 1, Y: 2}); err == nil {
+		t.Error("doubletap must be handled by the runner")
+	}
 	if _, err := StepCommand(Step{Action: "bogus"}); err == nil {
 		t.Error("unknown action must fail")
+	}
+}
+
+func TestParsePlanActivityTarget(t *testing.T) {
+	plan, err := ParsePlan([]byte(`
+version: 1
+cases:
+  - name: a
+    package: com.a
+    steps:
+      - {action: launch}
+      - {action: wait_activity, activity: .Main, timeout_ms: 5000}
+      - {action: assert_activity, text: .Main}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := plan.Cases[0].Steps
+	if steps[1].Activity != ".Main" || steps[2].Text != ".Main" {
+		t.Errorf("steps = %+v", steps)
+	}
+	if errs := plan.Validate(); len(errs) > 0 {
+		t.Fatal(errs)
+	}
+}
+
+func TestParsePlanDeepSteps(t *testing.T) {
+	plan, err := ParsePlan([]byte(`
+version: 1
+cases:
+  - name: deep
+    package: com.example.game
+    steps:
+      - {action: launch}
+      - {action: longpress, x: 10, y: 20, duration_ms: 900}
+      - {action: doubletap, x: 30, y: 40}
+      - {action: drag, x: 1, y: 2, x2: 3, y2: 4, duration_ms: 700}
+      - {action: stop}
+      - {action: clear}
+      - {action: grant, permissions: [android.permission.CAMERA, android.permission.RECORD_AUDIO]}
+      - {action: revoke, permissions: [android.permission.CAMERA]}
+      - {action: wait_activity, text: com.example.game/.Main, timeout_ms: 5000}
+      - {action: wait_text, text: "开始", timeout_ms: 5000}
+      - {action: assert_activity, text: .Main}
+      - {action: assert_text, text: "开始"}
+      - {action: assert_not_text, text: "崩溃"}
+      - {action: assert_package}
+      - {action: screenshot}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Cases[0].Steps) != 15 {
+		t.Fatalf("steps = %d", len(plan.Cases[0].Steps))
+	}
+}
+
+func TestValidateRejectsBadDeepSteps(t *testing.T) {
+	_, err := ParsePlan([]byte(`
+version: 1
+cases:
+  - name: bad
+    package: com.example.game
+    steps:
+      - {action: grant, permissions: ["bad permission"]}
+      - {action: wait_text, text: "", timeout_ms: -1}
+      - {action: assert_activity}
+      - {action: doubletap, x: -1, y: 2}
+      - {action: drag, x: 1, y: 2, x2: -1, y2: 4}
+`))
+	if err == nil {
+		t.Fatal("want validation errors")
+	}
+	msg := err.Error()
+	for _, want := range []string{"权限名无效", "需要 text", "timeout_ms", "doubletap", "drag"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error misses %q:\n%s", want, msg)
+		}
 	}
 }
 
@@ -423,6 +508,111 @@ func TestSleepCtxAndStepDuration(t *testing.T) {
 	}
 }
 
+func TestRunnerDeepActions(t *testing.T) {
+	zero := 0.0
+	plan := &Plan{Version: 1, Cases: []Case{{
+		Name: "deep", Package: "com.example.game", Steps: []Step{
+			{Action: "longpress", X: 10, Y: 20, DurationMS: 900},
+			{Action: "doubletap", X: 30, Y: 40},
+			{Action: "drag", X: 1, Y: 2, X2: 3, Y2: 4, DurationMS: 700},
+			{Action: "stop"},
+			{Action: "clear"},
+			{Action: "grant", Permissions: []string{"android.permission.CAMERA", "android.permission.RECORD_AUDIO"}},
+			{Action: "revoke", Permissions: []string{"android.permission.CAMERA"}},
+			{Action: "wait_activity", Text: "com.example.game/.Main", TimeoutMS: 3000},
+			{Action: "wait_text", Text: "开始", TimeoutMS: 3000},
+			{Action: "assert_activity", Text: ".Main"},
+			{Action: "assert_text", Text: "开始"},
+			{Action: "assert_not_text", Text: "崩溃"},
+			{Action: "assert_package"},
+		},
+		Assert: Assert{
+			MinFPS: &zero, MaxJank: &zero, MaxCPU: &zero, MaxMem: &zero,
+			MaxTemp: &zero, MaxFrameP95MS: &zero, MaxStartupMS: &zero,
+		},
+	}}}
+	dev := &fakeDevice{serial: "fake", reply: func(cmd string) (string, error) {
+		switch {
+		case strings.Contains(cmd, "dumpsys window windows"):
+			return "mCurrentFocus=Window{abc u0 com.example.game/.Main}\n", nil
+		case strings.Contains(cmd, "uiautomator dump"):
+			return "UI hierchary dumped to: /data/local/tmp/qawork-ui.xml\n", nil
+		case strings.HasPrefix(cmd, "cat "):
+			return `<hierarchy><node text="开始"/></hierarchy>`, nil
+		case strings.Contains(cmd, "pm clear"):
+			return "Success\n", nil
+		case strings.Contains(cmd, "pidof"):
+			return "12345\n", nil
+		}
+		return "", nil
+	}}
+	r, err := NewRunner(plan, 0, "fake", dev, &fakeSampler{}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := r.Run(context.Background())
+	if res.Failed {
+		t.Fatalf("res = %+v", res)
+	}
+	if len(res.Steps) != len(plan.Cases[0].Steps) {
+		t.Errorf("steps = %d", len(res.Steps))
+	}
+	calls := strings.Join(dev.allCalls(), "\n")
+	for _, want := range []string{
+		"input swipe 10 20 10 20 900",
+		"pm clear com.example.game",
+		"pm grant com.example.game android.permission.CAMERA",
+		"pm revoke com.example.game android.permission.CAMERA",
+		"pidof com.example.game",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Errorf("calls missing %q:\n%s", want, calls)
+		}
+	}
+	if strings.Count(calls, "input tap 30 40") != 2 {
+		t.Errorf("doubletap calls = %d", strings.Count(calls, "input tap 30 40"))
+	}
+}
+
+func TestRunnerAssertionFailsLoudly(t *testing.T) {
+	zero := 0.0
+	plan := &Plan{Version: 1, Cases: []Case{{
+		Name: "assert", Package: "com.example.game", Steps: []Step{
+			{Action: "assert_text", Text: "不存在的按钮"},
+		},
+		Assert: Assert{MinFPS: &zero, MaxJank: &zero, MaxCPU: &zero, MaxMem: &zero,
+			MaxTemp: &zero, MaxFrameP95MS: &zero, MaxStartupMS: &zero},
+	}}}
+	dev := &fakeDevice{serial: "fake", png: []byte("PNG"), reply: func(cmd string) (string, error) {
+		switch {
+		case strings.Contains(cmd, "uiautomator dump"):
+			return "UI hierchary dumped\n", nil
+		case strings.HasPrefix(cmd, "cat "):
+			return `<hierarchy><node text="开始"/></hierarchy>`, nil
+		}
+		return "", nil
+	}}
+	r, err := NewRunner(plan, 0, "fake", dev, &fakeSampler{}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := r.Run(context.Background())
+	if !res.Failed || !strings.Contains(res.Error, "界面没有文本") {
+		t.Fatalf("res = %+v", res)
+	}
+}
+
+func TestStepTimeout(t *testing.T) {
+	if got := stepTimeout(Step{}); got != 10*time.Second {
+		t.Errorf("default = %v", got)
+	}
+	if got := stepTimeout(Step{TimeoutMS: 2500}); got != 2500*time.Millisecond {
+		t.Errorf("timeout = %v", got)
+	}
+	if got := stepTimeout(Step{TimeoutMS: 999999}); got != 120*time.Second {
+		t.Errorf("clamped = %v", got)
+	}
+}
 func TestSafeName(t *testing.T) {
 	if got := safeName("登录 主界面!"); got != "" {
 		t.Errorf("non-ascii = %q", got)

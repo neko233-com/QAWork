@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/neko233-com/QAWork/internal/perf"
 )
 
 func TestParseWMSize(t *testing.T) {
@@ -25,30 +27,30 @@ func TestParseWMSize(t *testing.T) {
 	}
 }
 
-func TestAnalyzeLogcat(t *testing.T) {
+func TestAnalyzeLogcatAlias(t *testing.T) {
 	crashLog := `07-01 10:00:00.000 E AndroidRuntime: FATAL EXCEPTION: main
 07-01 10:00:00.001 E AndroidRuntime: Process: com.example.game, PID: 1234
 07-01 10:00:00.002 E AndroidRuntime: java.lang.RuntimeException: boom`
-	crash, anr := AnalyzeLogcat(crashLog, "com.example.game")
+	crash, anr := perf.AnalyzeLogcat(crashLog, "com.example.game")
 	if !crash || anr {
 		t.Errorf("crash=%v anr=%v", crash, anr)
 	}
 
 	otherCrash := `E AndroidRuntime: FATAL EXCEPTION: main
 E AndroidRuntime: Process: com.other.app, PID: 1`
-	if crash, _ := AnalyzeLogcat(otherCrash, "com.example.game"); crash {
+	if crash, _ := perf.AnalyzeLogcat(otherCrash, "com.example.game"); crash {
 		t.Error("unrelated crash must not count")
 	}
 
 	anrLog := `07-01 10:00:00 E ActivityManager: ANR in com.example.game (com.example.game/.Main)`
-	if crash, anr := AnalyzeLogcat(anrLog, "com.example.game"); crash || !anr {
+	if crash, anr := perf.AnalyzeLogcat(anrLog, "com.example.game"); crash || !anr {
 		t.Errorf("crash=%v anr=%v", crash, anr)
 	}
 
-	if crash, anr := AnalyzeLogcat("normal logs\n", "com.example"); crash || anr {
+	if crash, anr := perf.AnalyzeLogcat("normal logs\n", "com.example"); crash || anr {
 		t.Error("clean log flagged")
 	}
-	if crash, anr := AnalyzeLogcat(crashLog, ""); crash || anr {
+	if crash, anr := perf.AnalyzeLogcat(crashLog, ""); crash || anr {
 		t.Error("empty package must not match")
 	}
 }
@@ -105,12 +107,12 @@ func TestWriteCSV(t *testing.T) {
 	if recs[0][0] != "serial" || recs[0][len(recs[0])-1] != "artifacts" {
 		t.Errorf("header = %v", recs[0])
 	}
-	if recs[1][0] != "s1" || recs[1][8] != "true" || recs[2][21] != "false" {
+	if recs[1][0] != "s1" || recs[1][9] != "true" || recs[2][21] != "true" {
 		t.Errorf("row = %v / %v", recs[1], recs[2])
 	}
-	// Columns: installed=8, install_skipped=9, passed=21.
-	if recs[1][21] != "true" {
-		t.Errorf("passed = %q", recs[1][21])
+	// Columns: run=7, installed=9, crash=21, passed=23.
+	if recs[1][23] != "true" {
+		t.Errorf("passed = %q", recs[1][23])
 	}
 }
 
@@ -120,8 +122,27 @@ func TestWriteMatrix(t *testing.T) {
 		DeviceInfo: DeviceInfo{Serial: "s1", Model: "Pixel"}, Case: "smoke", Package: "com.a",
 	}}}
 	writeMatrix(&m)
-	if m.CSV == "" || m.JSON == "" {
+	if m.CSV == "" || m.JSON == "" || m.HTML == "" || m.JUnit == "" {
 		t.Fatalf("paths = %+v", m)
+	}
+	for _, p := range []string{m.CSV, m.JSON, m.HTML, m.JUnit} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("missing %s: %v", p, err)
+		}
+	}
+	htmlBytes, err := os.ReadFile(m.HTML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(htmlBytes), "s1") || !strings.Contains(string(htmlBytes), "smoke") {
+		t.Error("HTML report misses row")
+	}
+	junitBytes, err := os.ReadFile(m.JUnit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(junitBytes), `<testcase classname="s1"`) {
+		t.Error("JUnit report misses testcase")
 	}
 	if _, err := os.Stat(m.CSV); err != nil {
 		t.Error(err)
@@ -142,6 +163,19 @@ func TestWriteMatrix(t *testing.T) {
 	}
 	if filepath.Dir(m.JSON) != root {
 		t.Errorf("json dir = %q", filepath.Dir(m.JSON))
+	}
+}
+
+func TestWriteHTMLWithArtifacts(t *testing.T) {
+	root := t.TempDir()
+	m := Matrix{Root: root, Rows: []Row{{
+		Serial: "s1", Model: "Pixel", Case: "smoke", Run: 1,
+		CSV:        filepath.Join(root, "run.csv"),
+		Logcat:     filepath.Join(root, "logcat.txt"),
+		Screenshot: filepath.Join(root, "shot.png"),
+	}}}
+	if _, err := writeHTML(&m); err != nil {
+		t.Fatal(err)
 	}
 }
 

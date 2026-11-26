@@ -33,6 +33,39 @@ func TestNewDefaults(t *testing.T) {
 	}
 }
 
+func TestStressDefaultsAndEmptyPackage(t *testing.T) {
+	a := New(nil)
+	if a.stressDuration != "2 分钟" {
+		t.Errorf("duration = %q", a.stressDuration)
+	}
+	a.RunStress()
+	_, msg, running := a.StressState()
+	if running || !strings.Contains(msg, "包名") {
+		t.Errorf("msg=%q running=%v", msg, running)
+	}
+}
+
+func TestStressDurationValue(t *testing.T) {
+	for label, want := range map[string]time.Duration{
+		"1 分钟": time.Minute, "2 分钟": 2 * time.Minute,
+		"10 分钟": 10 * time.Minute, "30 分钟": 30 * time.Minute, "x": 2 * time.Minute,
+	} {
+		if got := stressDurationValue(label); got != want {
+			t.Errorf("%s = %s", label, got)
+		}
+	}
+}
+
+func TestCompatRepeatValue(t *testing.T) {
+	for label, want := range map[string]int{
+		"1 轮": 1, "2 轮": 2, "3 轮": 3, "5 轮": 5, "x": 1,
+	} {
+		if got := compatRepeatValue(label); got != want {
+			t.Errorf("%s = %d", label, got)
+		}
+	}
+}
+
 func TestAutomationStartGuards(t *testing.T) {
 	a := New(nil)
 	a.Target = "com.example.game"

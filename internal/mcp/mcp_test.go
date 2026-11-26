@@ -97,7 +97,7 @@ func TestToolsList(t *testing.T) {
 	m, _ := handleJSON(t, NewServer(), `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
 	result := m["result"].(map[string]any)
 	tools, ok := result["tools"].([]any)
-	if !ok || len(tools) < 7 {
+	if !ok || len(tools) < 11 {
 		t.Fatalf("tools = %v", result)
 	}
 	names := map[string]bool{}
@@ -111,6 +111,7 @@ func TestToolsList(t *testing.T) {
 	for _, want := range []string{
 		"qawork_devices", "qawork_perf", "qawork_report", "qawork_doctor",
 		"qawork_validate_plan", "qawork_run_plan", "qawork_compat_matrix",
+		"qawork_device_info", "qawork_logcat", "qawork_app", "qawork_stress",
 	} {
 		if !names[want] {
 			t.Errorf("missing tool %s", want)
@@ -357,6 +358,21 @@ func TestCompatToolRequiresPackageWithoutPlan(t *testing.T) {
 	if _, err := tool.Run(context.Background(), map[string]any{}); err == nil ||
 		!strings.Contains(err.Error(), "package") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+func TestStressToolRequiresPackage(t *testing.T) {
+	tool := findTool(t, "qawork_stress")
+	if _, err := tool.Run(context.Background(), map[string]any{}); err == nil ||
+		!strings.Contains(err.Error(), "package") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestAppToolRejectsUnknownAction(t *testing.T) {
+	tool := findTool(t, "qawork_app")
+	if _, err := tool.Run(context.Background(), map[string]any{"action": "shell"}); err == nil {
+		t.Error("unknown action must fail")
 	}
 }
 

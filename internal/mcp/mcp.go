@@ -38,7 +38,8 @@ func NewServer() *Server {
 		Instructions: "QAWork 是游戏 QA 工作台。Android 是首选验证平台：先 qawork_devices 找设备，" +
 			"再 qawork_perf 采一段（serial 可填 local 采本机进程，但 PC 没有帧率来源），" +
 			"最后用 qawork_report 复判 CSV。自动化用 qawork_validate_plan 校验 qawork.yaml，" +
-			"qawork_run_plan 跑步骤 + 采样 + 门禁，qawork_compat_matrix 批量过机型并抓 crash/ANR。" +
+			"qawork_run_plan 跑步骤 + 采样 + 门禁，qawork_compat_matrix 批量过机型并抓 crash/ANR，" +
+			"qawork_stress 长随机 monkey 压测；设备操作走 qawork_device_info/logcat/app，不做任意 shell。" +
 			"所有数字来自 adb / SurfaceFlinger / gfxinfo / proc，不造假。",
 		Tools: defaultTools(),
 	}

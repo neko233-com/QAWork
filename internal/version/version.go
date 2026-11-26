@@ -4,5 +4,5 @@ package version
 // Product is the product name shown in the window, the CLI and the reports.
 const Product = "QAWork"
 
-// Version is the current release version, bumped by the release workflow.
-var Version = "0.3.0"
+// Version is the current release version, bumped by scripts/release.ps1.
+var Version = "0.4.0"

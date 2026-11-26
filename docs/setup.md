@@ -46,7 +46,7 @@ tools/
 
 ```powershell
 qawork setup check                 # 人类可读；缺必装项退出码 2
-qawork setup check -json           # 给 agent / CI
+qawork setup check -json           # 给 agent / 本地脚本
 qawork setup install -id adb       # 缺 adb 才下载，已装则跳过
 qawork setup install -id scrcpy
 qawork setup install -id adb,scrcpy

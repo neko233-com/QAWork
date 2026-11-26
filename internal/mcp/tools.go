@@ -3,14 +3,17 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/neko233-com/QAWork/internal/adbkit"
 	"github.com/neko233-com/QAWork/internal/automation"
 	"github.com/neko233-com/QAWork/internal/compat"
 	"github.com/neko233-com/QAWork/internal/perf"
 	"github.com/neko233-com/QAWork/internal/setup"
+	"github.com/neko233-com/QAWork/internal/stress"
 )
 
 func defaultTools() []Tool {
@@ -110,9 +113,78 @@ func defaultTools() []Tool {
 					"devices":         map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "设备序列号；留空全部在线"},
 					"artifacts":       map[string]any{"type": "string", "description": "产物根目录"},
 					"timeout_seconds": map[string]any{"type": "number", "description": "单个 case 超时，默认 600，上限 1800"},
+					"repeat":          map[string]any{"type": "number", "description": "每台设备每个 case 重复轮数，默认 1，上限 100"},
+					"reset":           map[string]any{"type": "boolean", "description": "每轮前 pm clear 应用数据"},
 				},
 			},
 			Run: toolCompatMatrix,
+		},
+		{
+			Name: "qawork_device_info",
+			Description: "读取一台设备的型号、品牌、Android/SDK、ABI、分辨率、密度、电量/电池温度。" +
+				"serial 留空取第一台在线设备。",
+			Schema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"serial": map[string]any{"type": "string", "description": "设备序列号；留空第一台在线"},
+				},
+			},
+			Run: toolDeviceInfo,
+		},
+		{
+			Name:        "qawork_logcat",
+			Description: "读取设备 logcat 最后 N 行，可选先清空、可选写到宿主文件。排查 crash/ANR 用。",
+			Schema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"serial": map[string]any{"type": "string", "description": "设备序列号；留空第一台在线"},
+					"lines":  map[string]any{"type": "number", "description": "最后 N 行，默认 500，上限 5000"},
+					"clear":  map[string]any{"type": "boolean", "description": "先 logcat -c"},
+					"output": map[string]any{"type": "string", "description": "可选宿主输出文件"},
+				},
+			},
+			Run: toolLogcat,
+		},
+		{
+			Name: "qawork_app",
+			Description: "设备上的显式应用操作：install / uninstall / start / stop / clear / grant / revoke / animations。" +
+				"不提供任意 shell 透传；start 返回解析到的 activity 与启动耗时。",
+			Schema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"action":      map[string]any{"type": "string", "enum": []string{"install", "uninstall", "start", "stop", "clear", "grant", "revoke", "animations"}, "description": "操作"},
+					"serial":      map[string]any{"type": "string", "description": "设备序列号；留空第一台在线"},
+					"package":     map[string]any{"type": "string", "description": "Android 包名"},
+					"apk":         map[string]any{"type": "string", "description": "install 时的 APK 路径"},
+					"activity":    map[string]any{"type": "string", "description": "start 时显式 activity；留空自动解析"},
+					"cold":        map[string]any{"type": "boolean", "description": "start 是否冷启动，默认 false"},
+					"permissions": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "grant/revoke 的权限列表"},
+					"keep":        map[string]any{"type": "boolean", "description": "uninstall 保留数据"},
+					"animations":  map[string]any{"type": "string", "enum": []string{"on", "off"}, "description": "animations 动作的开关"},
+				},
+				"required": []string{"action"},
+			},
+			Run: toolApp,
+		},
+		{
+			Name: "qawork_stress",
+			Description: "长随机 monkey 压测：先启动应用，再边跑随机输入边采样，结束后按包名扫 crash/ANR，" +
+				"输出 CSV/JSON/logcat/monkey 证据。可传 devices 批量跑。",
+			Schema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"package":          map[string]any{"type": "string", "description": "Android 包名"},
+					"serial":           map[string]any{"type": "string", "description": "单台设备；留空第一台在线"},
+					"devices":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "多台设备序列号"},
+					"duration_seconds": map[string]any{"type": "number", "description": "最长时长，默认 300，上限 7200"},
+					"events":           map[string]any{"type": "number", "description": "monkey 事件数，默认 3000，上限 1000000"},
+					"throttle_ms":      map[string]any{"type": "number", "description": "事件间隔毫秒，默认 300"},
+					"interval_ms":      map[string]any{"type": "number", "description": "采样间隔毫秒，默认 1000"},
+					"artifacts":        map[string]any{"type": "string", "description": "产物根目录"},
+				},
+				"required": []string{"package"},
+			},
+			Run: toolStress,
 		},
 	}
 }
@@ -348,11 +420,195 @@ func toolCompatMatrix(ctx context.Context, args map[string]any) (any, error) {
 		Package: argString(args, "package"), APKPath: argString(args, "apk"),
 		Devices: argStringSlice(args, "devices"), ArtifactsRoot: root,
 		Timeout: time.Duration(timeout) * time.Second,
+		Repeat:  int(argFloat(args, "repeat", 1)), ResetData: argBool(args, "reset"),
 	})
 	if err != nil {
 		return nil, err
 	}
 	return matrix, nil
+}
+
+func toolDeviceInfo(ctx context.Context, args map[string]any) (any, error) {
+	serial, err := serialOrFirst(ctx, argString(args, "serial"))
+	if err != nil {
+		return nil, err
+	}
+	info, err := (adbkit.Client{ADB: perf.ADB{Path: setup.ADBPath()}}).Info(ctx, serial)
+	if err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+func toolLogcat(ctx context.Context, args map[string]any) (any, error) {
+	serial, err := serialOrFirst(ctx, argString(args, "serial"))
+	if err != nil {
+		return nil, err
+	}
+	lines := int(argFloat(args, "lines", 500))
+	if lines <= 0 {
+		lines = 500
+	}
+	if lines > 5000 {
+		lines = 5000
+	}
+	client := adbkit.Client{ADB: perf.ADB{Path: setup.ADBPath()}}
+	logText, err := client.LogcatDump(ctx, serial, lines, argBool(args, "clear"))
+	if err != nil {
+		return nil, err
+	}
+	out := argString(args, "output")
+	if out != "" {
+		if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(out, []byte(logText), 0o644); err != nil {
+			return nil, err
+		}
+		return map[string]any{"serial": serial, "path": out, "lines": lines}, nil
+	}
+	return map[string]any{"serial": serial, "log": logText, "lines": lines}, nil
+}
+
+func toolApp(ctx context.Context, args map[string]any) (any, error) {
+	action := argString(args, "action")
+	serial, err := serialOrFirst(ctx, argString(args, "serial"))
+	if err != nil {
+		return nil, err
+	}
+	client := adbkit.Client{ADB: perf.ADB{Path: setup.ADBPath()}}
+	pkg := argString(args, "package")
+	switch action {
+	case "install":
+		apk := argString(args, "apk")
+		out, err := client.Install(ctx, serial, apk, true, true)
+		if err != nil {
+			return nil, err
+		}
+		if !strings.Contains(strings.ToLower(out), "success") {
+			return nil, fmt.Errorf("安装未返回 Success: %s", strings.TrimSpace(out))
+		}
+		return map[string]any{"serial": serial, "apk": apk, "output": out, "success": true}, nil
+	case "uninstall":
+		out, err := client.Uninstall(ctx, serial, pkg, argBool(args, "keep"))
+		if err != nil {
+			return nil, err
+		}
+		if !strings.Contains(strings.ToLower(out), "success") {
+			return nil, fmt.Errorf("卸载未返回 Success: %s", strings.TrimSpace(out))
+		}
+		return map[string]any{"serial": serial, "package": pkg, "output": out}, nil
+	case "start":
+		dev := automation.NewADBDevice(perf.ADB{Path: setup.ADBPath()}, serial)
+		return automation.Launch(ctx, dev, pkg, argString(args, "activity"), argBool(args, "cold"))
+	case "stop":
+		return simpleClientResult(client.Stop(ctx, serial, pkg))
+	case "clear":
+		out, err := client.Clear(ctx, serial, pkg)
+		if err != nil {
+			return nil, err
+		}
+		if !strings.Contains(strings.ToLower(out), "success") {
+			return nil, fmt.Errorf("pm clear 未返回 Success: %s", strings.TrimSpace(out))
+		}
+		return map[string]any{"serial": serial, "package": pkg, "output": out, "success": true}, nil
+	case "grant":
+		out, err := client.Grant(ctx, serial, pkg, argStringSlice(args, "permissions"))
+		return map[string]any{"serial": serial, "package": pkg, "permissions": out}, err
+	case "revoke":
+		out, err := client.Revoke(ctx, serial, pkg, argStringSlice(args, "permissions"))
+		return map[string]any{"serial": serial, "package": pkg, "permissions": out}, err
+	case "animations":
+		state := argString(args, "animations")
+		if state != "on" && state != "off" {
+			return nil, fmt.Errorf("animations 需要 on 或 off")
+		}
+		if err := client.Animations(ctx, serial, state == "on"); err != nil {
+			return nil, err
+		}
+		return map[string]any{"serial": serial, "animations": state}, nil
+	default:
+		return nil, fmt.Errorf("未知 action %q", action)
+	}
+}
+
+func simpleClientResult(out string, err error) (any, error) {
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"output": out}, nil
+}
+
+func toolStress(ctx context.Context, args map[string]any) (any, error) {
+	pkg := argString(args, "package")
+	if pkg == "" {
+		return nil, fmt.Errorf("缺少 package")
+	}
+	duration := argFloat(args, "duration_seconds", 300)
+	if duration <= 0 {
+		duration = 300
+	}
+	if duration > 7200 {
+		duration = 7200
+	}
+	events := int(argFloat(args, "events", 3000))
+	throttle := int(argFloat(args, "throttle_ms", 300))
+	interval := time.Duration(argFloat(args, "interval_ms", 1000)) * time.Millisecond
+	root := argString(args, "artifacts")
+	if root == "" {
+		root = filepath.Join(setup.HomeDir(), "stress", time.Now().Format("20060102-150405"))
+	}
+	serials := argStringSlice(args, "devices")
+	if len(serials) == 0 {
+		serials = []string{argString(args, "serial")}
+	}
+	var results []stress.Result
+	for _, serial := range serials {
+		oneRoot := root
+		if serial != "" {
+			oneRoot = filepath.Join(root, nameSafe(serial))
+		}
+		res, err := stress.Run(ctx, stress.Options{
+			ADB: perf.ADB{Path: setup.ADBPath()}, Serial: serial, Package: pkg,
+			Duration: time.Duration(duration * float64(time.Second)), Events: events,
+			ThrottleMS: throttle, Interval: interval, ArtifactsRoot: oneRoot,
+		})
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, res)
+	}
+	failed := false
+	for _, r := range results {
+		if r.Failed {
+			failed = true
+		}
+	}
+	return map[string]any{"package": pkg, "results": results, "failed": failed, "artifacts": root}, nil
+}
+
+func serialOrFirst(ctx context.Context, requested string) (string, error) {
+	if strings.TrimSpace(requested) != "" {
+		return strings.TrimSpace(requested), nil
+	}
+	serial := firstSerial(ctx)
+	if serial == "" {
+		return "", fmt.Errorf("没有在线 Android 设备；先 qawork_devices")
+	}
+	return serial, nil
+}
+
+func nameSafe(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	return strings.Trim(b.String(), "-.")
 }
 
 func argStringSlice(args map[string]any, key string) []string {
@@ -422,4 +678,11 @@ func argFloat(args map[string]any, key string, def float64) float64 {
 		return v
 	}
 	return def
+}
+
+func argBool(args map[string]any, key string) bool {
+	if v, ok := args[key].(bool); ok {
+		return v
+	}
+	return false
 }
